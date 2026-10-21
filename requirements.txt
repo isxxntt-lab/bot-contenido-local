@@ -1,0 +1,2 @@
+# Bot 100% local: solo el lector de RSS. Sin SDKs de modelos ni APIs de pago.
+feedparser>=6.0
