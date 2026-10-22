@@ -1,7 +1,7 @@
 """Orquestador del bot de contenido local.
 
-Flujo: RSS -> reglas de formatter.py -> consola y carpeta output/.
-El formateo es determinista: expresiones regulares y una plantilla, sin API.
+Flujo: RSS -> reglas de formatter.py -> vídeo de video_editor.py -> output/.
+El formateo del post es determinista. La voz usa edge-tts, sin clave y sin cargo.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from pathlib import Path
 
 from formatter import format_post
 from scraper import fetch_latest_news
+from video_editor import LATEST_VIDEO, render_news_video, select_article
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -136,6 +137,20 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nPosts guardados: {len(records)}")
     print(f"JSON: {json_path}")
     print(f"TXT:  {txt_path}")
+
+    article = select_article(records)
+    video_path = args.output_dir / LATEST_VIDEO.name
+    print(f"\nMontando vídeo de: {article.get('title', '')}")
+    try:
+        rendered = render_news_video(article, video_path)
+    except Exception as exc:
+        print(f"No se pudo generar el vídeo: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Vídeo: {rendered['video']} ({rendered['video'].stat().st_size} bytes)")
+    print(f"Audio: {rendered['audio']}")
+    print(f"Palabras sincronizadas: {rendered['cues']}")
+    print(f"Fondo: {rendered['background'] or 'degradado generado'}")
     return 0
 
 

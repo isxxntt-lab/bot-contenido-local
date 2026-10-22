@@ -1,2 +1,8 @@
-# Bot 100% local: solo el lector de RSS. Sin SDKs de modelos ni APIs de pago.
+# Lectura RSS. Sin SDKs de modelos de pago.
 feedparser>=6.0
+
+# Voz neuronal de Microsoft Edge. Sin clave y sin cargo.
+edge-tts>=7.3
+
+# Montaje del vídeo vertical. Trae el ffmpeg embebido de imageio.
+moviepy>=2.1
