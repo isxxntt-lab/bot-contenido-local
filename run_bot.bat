@@ -7,7 +7,6 @@ cd /d "%~dp0"
 
 if not exist ".venv\Scripts\activate.bat" (
     echo No se encontró el entorno virtual .venv en esta carpeta.
-    pause
     exit /b 1
 )
 
@@ -16,11 +15,9 @@ python main.py
 if errorlevel 1 (
     echo.
     echo La extracción terminó con errores.
-    pause
     exit /b 1
 )
 
 echo.
 echo La extracción finalizó correctamente. Los posts están en la carpeta output.
-pause
 endlocal
