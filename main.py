@@ -1,7 +1,7 @@
 """Orquestador del bot de contenido local.
 
 Flujo: RSS -> reglas de formatter.py -> consola y carpeta output/.
-No envía el texto a ningún servicio externo.
+El formateo es determinista: expresiones regulares y una plantilla, sin API.
 """
 
 from __future__ import annotations
@@ -32,10 +32,12 @@ def _utf8_stdio() -> None:
             pass
 
 
-def build_records(articles: list[dict]) -> list[dict]:
-    """Pasa cada noticia por el motor de reglas. Omite las que vengan rotas."""
+def process_articles(articles: list[dict]) -> list[dict]:
+    """Formatea cada noticia y la muestra en consola. Omite las que vengan rotas."""
     records: list[dict] = []
-    for article in articles:
+    total = len(articles)
+
+    for index, article in enumerate(articles, 1):
         try:
             record = format_post(
                 title=article.get("title", ""),
@@ -44,19 +46,28 @@ def build_records(articles: list[dict]) -> list[dict]:
                 source=article.get("source", ""),
             )
         except ValueError as exc:
-            print(f"Aviso: noticia omitida ({exc})", file=sys.stderr)
+            print(f"Aviso: noticia {index} omitida ({exc})", file=sys.stderr)
             continue
 
         record["published"] = article.get("published", "")
         records.append(record)
+
+        print(f"\n{'=' * 60}")
+        print(f"POST {len(records)} de {total}")
+        print(f"{'=' * 60}")
+        print(record["post"], end="" if record["post"].endswith("\n") else "\n")
+
     return records
 
 
-def save_results(records: list[dict], output_dir: Path) -> tuple[Path, Path]:
-    """Guarda un JSON estructurado y un .txt listo para copiar."""
+def save_posts(records: list[dict], output_dir: Path) -> tuple[Path, Path]:
+    """Crea output/ si hace falta y guarda posts_YYYYMMDD.json y posts_YYYYMMDD.txt."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     generated_at = datetime.now().isoformat(timespec="seconds")
+    stamp = datetime.now().strftime("%Y%m%d")
+    json_path = output_dir / f"posts_{stamp}.json"
+    txt_path = output_dir / f"posts_{stamp}.txt"
 
     payload = {
         "generated_at": generated_at,
@@ -64,13 +75,7 @@ def save_results(records: list[dict], output_dir: Path) -> tuple[Path, Path]:
         "count": len(records),
         "posts": records,
     }
-
-    json_path = output_dir / f"posts_{stamp}.json"
-    txt_path = output_dir / f"posts_{stamp}.txt"
-    json_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    json_text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
 
     blocks = [
         f"Generado: {generated_at}",
@@ -80,15 +85,12 @@ def save_results(records: list[dict], output_dir: Path) -> tuple[Path, Path]:
     for index, record in enumerate(records, 1):
         blocks.append(f"\n{'=' * 60}\nPOST {index}\n{'=' * 60}\n")
         blocks.append(record["post"].rstrip())
-        if record["matched_keywords"]:
-            blocks.append(
-                "\nKeywords: " + ", ".join(record["matched_keywords"])
-            )
-    txt_path.write_text("\n".join(blocks).rstrip() + "\n", encoding="utf-8")
+        if record.get("matched_keywords"):
+            blocks.append("\nKeywords: " + ", ".join(record["matched_keywords"]))
+    txt_text = "\n".join(blocks).rstrip() + "\n"
 
-    # Copia estable para abrir siempre el último resultado sin buscar la hora.
-    (output_dir / "latest.json").write_text(json_path.read_text(encoding="utf-8"), encoding="utf-8")
-    (output_dir / "latest.txt").write_text(txt_path.read_text(encoding="utf-8"), encoding="utf-8")
+    json_path.write_text(json_text, encoding="utf-8")
+    txt_path.write_text(txt_text, encoding="utf-8")
     return json_path, txt_path
 
 
@@ -125,20 +127,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(f"Noticias útiles: {len(articles)}. Aplicando reglas locales...")
-    records = build_records(articles)
+    records = process_articles(articles)
     if not records:
         print("Ninguna noticia pudo formatearse.")
         return 1
 
-    json_path, txt_path = save_results(records, args.output_dir)
-
-    print()
-    for index, record in enumerate(records, 1):
-        print(f"{'=' * 60}")
-        print(f"POST {index}")
-        print(f"{'=' * 60}")
-        print(record["post"])
-
+    json_path, txt_path = save_posts(records, args.output_dir)
+    print(f"\nPosts guardados: {len(records)}")
     print(f"JSON: {json_path}")
     print(f"TXT:  {txt_path}")
     return 0
