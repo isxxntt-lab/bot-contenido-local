@@ -1,0 +1,39 @@
+{
+  "id": "20261023-a1b2c3d4",
+  "generado_en": "2026-10-23T09:30:00Z",
+  "noticia": {
+    "titulo": "OpenAI lanza GPT-6 con razonamiento nativo",
+    "fuente": "TechCrunch",
+    "url": "https://techcrunch.com/ejemplo-noticia",
+    "resumen": "OpenAI ha presentado su nuevo modelo con razonamiento integrado, disponible esta semana para todos los usuarios."
+  },
+  "video": {
+    "formato": "9:16",
+    "duracion_objetivo_seg": 45,
+    "hook": "Esto acaba de cambiar la IA para siempre.",
+    "guion": "OpenAI acaba de lanzar GPT-6 y esto cambia todo. El nuevo modelo razona de forma nativa, sin trucos ni cadenas de prompts. En las primeras pruebas resuelve problemas que GPT-5 no podia tocar. La diferencia: ahora piensa antes de responder, igual que un humano. Los desarrolladores ya lo llaman el salto mas grande desde ChatGPT. Sigeme para mas noticias de IA.",
+    "cta": "Sigeme para mas noticias de IA.",
+    "hashtags": ["#IA", "#tecnologia", "#OpenAI", "#GPT6", "#noticias"],
+    "voz": "es-ES-AlvaroNeural"
+  },
+  "audio": {
+    "modo": "full_auto",
+    "archivo": null,
+    "palabras": []
+  },
+  "broll": {
+    "keywords": ["inteligencia artificial", "robot", "oficina tecnologia"],
+    "clips": []
+  },
+  "render": {
+    "motor": "json2video",
+    "plantilla": "TU_TEMPLATE_ID",
+    "callback_url": null
+  },
+  "publicacion": {
+    "plataformas": ["youtube"],
+    "titulo_yt": "OpenAI lanza GPT-6 con razonamiento nativo #IA",
+    "descripcion_yt": "Fuente: TechCrunch https://techcrunch.com/ejemplo-noticia\n#IA #tecnologia #OpenAI",
+    "privacidad": "public"
+  }
+}

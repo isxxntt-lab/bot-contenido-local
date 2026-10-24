@@ -30,3 +30,14 @@ Los posts quedan en `output/` (esa carpeta no se versiona). `output/latest.txt` 
 - `main.py`: orquesta el flujo y guarda el resultado.
 
 Para añadir un hashtag, edita `KEYWORD_HASHTAGS` en `formatter.py`.
+
+## Flujo híbrido con n8n (opcional)
+
+Si defines `N8N_WEBHOOK_URL` y `N8N_API_KEY`, `main.py` envía cada noticia al
+workflow de n8n: b-roll de Pexels, render vertical con JSON2Video (subtítulos
+dinámicos palabra a palabra) y aviso con el MP4 por Telegram. Sin esas variables,
+el bot usa el montaje 100% local de `video_editor.py` como plan B.
+
+- Workflow importable y docker-compose de n8n: carpeta `n8n/`.
+- Contrato de datos, arquitectura y puesta en marcha: `docs/ARQUITECTURA-HIBRIDA.md`.
+- Claves de servicios (Pexels, JSON2Video, Telegram): `n8n/.env.n8n.example`.

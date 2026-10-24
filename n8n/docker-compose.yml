@@ -1,0 +1,29 @@
+# n8n self-hosted — coste $0. Requiere Docker Desktop (Windows).
+# Arranque:  docker compose up -d   →  UI en http://localhost:5678
+#
+# Las claves de los servicios externos viven en n8n/.env.n8n (env_file) y se
+# leen en los nodos con expresiones $env (p. ej. $env.PEXELS_API_KEY).
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    env_file:
+      - .env.n8n
+    environment:
+      - GENERIC_TIMEZONE=Europe/Madrid
+      - TZ=Europe/Madrid
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      # Webhook en local sin HTTPS:
+      - N8N_SECURE_COOKIE=false
+      - N8N_WEBHOOK_URL=http://localhost:5678/
+      # Permite usar $env en los nodos del workflow:
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:

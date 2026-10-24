@@ -6,3 +6,6 @@ edge-tts>=7.3
 
 # Montaje del vídeo vertical. Trae el ffmpeg embebido de imageio.
 moviepy>=2.1
+
+# Cliente webhook hacia n8n (render híbrido).
+requests>=2.31

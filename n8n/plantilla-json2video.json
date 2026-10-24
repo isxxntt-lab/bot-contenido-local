@@ -1,0 +1,65 @@
+{
+  "comment": "TechNewsVertical v1 — referencia con placeholders. Edítala en el editor de JSON2Video o envíala por POST /v2/movies sustituyendo los {{placeholders}}. La versión viva (con lógica condicional de clips) está en el nodo Code 'Construir Movie JSON' del workflow de n8n.",
+  "quality": "high",
+  "width": 1080,
+  "height": 1920,
+  "variables": {
+    "titulo": "OpenAI lanza GPT-6 con razonamiento nativo",
+    "fuente": "TechCrunch",
+    "guion": "Aquí va la locución completa. Los subtítulos se transcriben y sincronizan automáticamente.",
+    "hashtags": "#IA #tecnologia #OpenAI",
+    "voz": "es-ES-AlvaroNeural",
+    "clip1": "https://videos.pexels.com/video-files/HOOK.mp4",
+    "clip2": "https://videos.pexels.com/video-files/CUERPO.mp4",
+    "clip3": "https://videos.pexels.com/video-files/CTA.mp4"
+  },
+  "scenes": [
+    {
+      "comment": "HOOK (5s): b-roll + titular + badge de fuente",
+      "elements": [
+        { "type": "video", "src": "{{clip1}}", "resize": "cover", "position": "center-center", "duration": 5, "muted": true, "fade-in": 0.3 },
+        { "type": "text", "text": "{{titulo}}", "duration": 5, "fade-in": 0.4, "fade-out": 0.5, "position": "custom", "x": "center", "y": "18%", "width": "84%", "z-index": 5,
+          "settings": { "font-family": "Oswald", "font-size": "76px", "font-weight": "700", "color": "#FFFFFF", "text-align": "center", "background-color": "rgba(10,10,20,0.60)", "padding": "22px" } },
+        { "type": "text", "text": "{{fuente}}", "duration": 5, "start": 0.5, "fade-in": 0.4, "position": "custom", "x": "center", "y": "33%", "width": "40%", "z-index": 6,
+          "settings": { "font-family": "Roboto", "font-size": "34px", "font-weight": "500", "color": "#0B0B0F", "background-color": "#FFE900", "text-align": "center", "padding": "8px 18px" } }
+      ]
+    },
+    {
+      "comment": "CUERPO: b-roll en bucle + locución Azure (la escena dura lo que la voz)",
+      "elements": [
+        { "type": "video", "src": "{{clip2}}", "resize": "cover", "position": "center-center", "duration": -2, "muted": true, "loop": -1 },
+        { "type": "voice", "voice": "{{voz}}", "model": "azure", "text": "{{guion}}", "extra-time": 1.2 }
+      ]
+    },
+    {
+      "comment": "CTA (3s): b-roll + hashtags",
+      "elements": [
+        { "type": "video", "src": "{{clip3}}", "resize": "cover", "position": "center-center", "duration": 3, "muted": true, "fade-out": 0.6 },
+        { "type": "text", "text": "{{hashtags}}", "duration": 3, "fade-in": 0.3, "position": "custom", "x": "center", "y": "72%", "width": "86%", "z-index": 5,
+          "settings": { "font-family": "Oswald", "font-size": "44px", "font-weight": "600", "color": "#FFFFFF", "text-align": "center" } }
+      ]
+    }
+  ],
+  "elements": [
+    {
+      "comment": "Subtítulos estilo Hormozi: UNA sola vez a nivel de movie; transcribe la locución automáticamente",
+      "type": "subtitles",
+      "language": "es",
+      "model": "default",
+      "settings": {
+        "style": "classic-one-word",
+        "position": "custom",
+        "x": 540,
+        "y": 1480,
+        "font-family": "Oswald",
+        "font-size": 92,
+        "max-words-per-line": 1,
+        "all-caps": true,
+        "word-color": "#FFE900",
+        "line-color": "#FFFFFF",
+        "outline-color": "#000000",
+        "outline-width": 6
+      }
+    }
+  ]
+}

@@ -1,18 +1,24 @@
 """Orquestador del bot de contenido local.
 
-Flujo: RSS -> reglas de formatter.py -> vídeo de video_editor.py -> output/.
-El formateo del post es determinista. La voz usa edge-tts, sin clave y sin cargo.
+Flujo: RSS -> reglas de formatter.py -> vídeo.
+
+Render híbrido: si N8N_WEBHOOK_URL está definido, cada noticia se envía al
+workflow de n8n (b-roll de Pexels, render con JSON2Video y aviso por Telegram).
+Si no lo está, se usa el montaje local de video_editor.py con edge-tts,
+sin clave y sin cargo.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
 from formatter import format_post
+from n8n_client import N8NClient, N8NError, construir_payload
 from scraper import fetch_latest_news
 from video_editor import LATEST_VIDEO, render_news_video, select_article
 
@@ -95,6 +101,39 @@ def save_posts(records: list[dict], output_dir: Path) -> tuple[Path, Path]:
     return json_path, txt_path
 
 
+def enviar_render_n8n(records: list[dict]) -> int:
+    """Envía cada noticia al workflow de n8n y devuelve cuántas se aceptaron.
+
+    Un envío fallido no corta el flujo: se avisa por stderr y se continúa con
+    el resto. n8n responde en el acto; el render llega después por Telegram.
+    """
+    aceptados = 0
+    cliente = N8NClient()
+    for record in records:
+        guion = (
+            f"{record['hook']} {record['title']}. {record['summary']} "
+            "Sígueme para más noticias de IA."
+        )
+        payload = construir_payload(
+            noticia={
+                "titulo": record["title"],
+                "fuente": record.get("source", ""),
+                "url": record["link"],
+                "resumen": record["summary"],
+            },
+            guion=guion,
+            hashtags=record["hashtags"],
+            hook=record["hook"],
+            broll_keywords=record.get("matched_keywords") or ["inteligencia artificial"],
+        )
+        try:
+            cliente.enviar(payload)
+            aceptados += 1
+        except N8NError as exc:
+            print(f"Aviso: n8n rechazó '{record['title']}' ({exc})", file=sys.stderr)
+    return aceptados
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Bot de contenido local: RSS de IA y posts por reglas, sin APIs de pago.",
@@ -137,6 +176,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nPosts guardados: {len(records)}")
     print(f"JSON: {json_path}")
     print(f"TXT:  {txt_path}")
+
+    if os.getenv("N8N_WEBHOOK_URL"):
+        print("\nRender híbrido activo: enviando noticias a n8n...")
+        aceptados = enviar_render_n8n(records)
+        print(f"Trabajos aceptados por n8n: {aceptados} de {len(records)}.")
+        print("Los vídeos llegan por Telegram cuando termine cada render.")
+        return 0
 
     article = select_article(records)
     video_path = args.output_dir / LATEST_VIDEO.name

@@ -1,0 +1,462 @@
+{
+  "name": "Bot Contenido — Renderer (noticia → vídeo vertical)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## 📥 ENTRADA\nPython envía el payload estructurado a `POST /webhook/bot-contenido`.\n\n1. Activa el workflow y copia la URL de producción del webhook.\n2. Crea una credencial **Header Auth** (nombre: `X-API-KEY`… usa el nombre que prefieras) y selecciónala aquí.\n3. En Python exporta `N8N_WEBHOOK_URL` y `N8N_API_KEY` con ese mismo valor.\n\nEl workflow responde 200 inmediatamente y sigue renderizando en segundo plano.",
+        "height": 320,
+        "width": 360,
+        "color": 4
+      },
+      "id": "sticky-entrada",
+      "name": "Sticky — Entrada",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-420, -160]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "bot-contenido",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-bot-contenido",
+      "name": "Webhook Bot Contenido",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 0],
+      "webhookId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": null,
+          "name": "Bot Contenido API Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "a1", "name": "id", "value": "={{ $json.body.id }}", "type": "string" },
+            { "id": "a2", "name": "titulo", "value": "={{ $json.body.noticia.titulo }}", "type": "string" },
+            { "id": "a3", "name": "fuente", "value": "={{ $json.body.noticia.fuente }}", "type": "string" },
+            { "id": "a4", "name": "url_origen", "value": "={{ $json.body.noticia.url }}", "type": "string" },
+            { "id": "a5", "name": "hook", "value": "={{ $json.body.video.hook }}", "type": "string" },
+            { "id": "a6", "name": "guion", "value": "={{ $json.body.video.guion }}", "type": "string" },
+            { "id": "a7", "name": "hashtags", "value": "={{ ($json.body.video.hashtags || []).join(' ') }}", "type": "string" },
+            { "id": "a8", "name": "voz", "value": "={{ $json.body.video.voz || 'es-ES-AlvaroNeural' }}", "type": "string" },
+            { "id": "a9", "name": "motor", "value": "={{ $json.body.render.motor || 'json2video' }}", "type": "string" },
+            { "id": "a10", "name": "plantilla", "value": "={{ $json.body.render.plantilla }}", "type": "string" },
+            { "id": "a11", "name": "broll_keywords", "value": "={{ ($json.body.broll.keywords || []).join(' ') || 'tecnologia inteligencia artificial' }}", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "normalizar-payload",
+      "name": "Normalizar Payload",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'aceptado', id: $json.id, motor: $json.motor } }}",
+        "options": {}
+      },
+      "id": "responder-200",
+      "name": "Aceptar (HTTP 200)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [440, -160]
+    },
+    {
+      "parameters": {
+        "content": "## 🔎 B-ROLL\nPexels API (gratis con clave en $env.PEXELS_API_KEY).\nBusca vídeo vertical según las keywords del payload y selecciona hasta 4 clips.",
+        "height": 200,
+        "width": 320,
+        "color": 5
+      },
+      "id": "sticky-broll",
+      "name": "Sticky — B-Roll",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [400, 140]
+    },
+    {
+      "parameters": {
+        "url": "https://api.pexels.com/videos/search",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "query", "value": "={{ $json.broll_keywords }}" },
+            { "name": "per_page", "value": "6" },
+            { "name": "orientation", "value": "portrait" },
+            { "name": "size", "value": "medium" }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "={{ $env.PEXELS_API_KEY }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "pexels-buscar",
+      "name": "Pexels: Buscar B-Roll",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Selecciona hasta 4 clips verticales de Pexels y los adjunta al payload.\nconst base = $('Normalizar Payload').first().json;\nconst data = $input.first().json;\nconst clips = [];\nfor (const video of data.videos || []) {\n  const verticales = (video.video_files || [])\n    .filter((f) => f.height >= f.width)\n    .sort((a, b) => (b.height || 0) - (a.height || 0));\n  if (verticales.length > 0) {\n    clips.push({\n      url: verticales[0].link,\n      duracion: video.duration,\n      creditos: video.user ? video.user.name : 'Pexels',\n    });\n  }\n  if (clips.length >= 4) break;\n}\nif (clips.length === 0) {\n  throw new Error('Pexels no devolvio clips verticales para: ' + base.broll_keywords);\n}\nreturn [{ json: { ...base, clips } }];"
+      },
+      "id": "seleccionar-clips",
+      "name": "Seleccionar Clips",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 220]
+    },
+    {
+      "parameters": {
+        "content": "## 🎬 RENDER\nMotor intercambiable vía `payload.render.motor`:\n- **json2video** → API cloud (plantilla + variables). Fase 1.\n- **remotion** → render local sin watermark, $0 real. Fase 2.\n\nClona el bloque Esperar→Estado→IF para Shotstack si lo añades.",
+        "height": 260,
+        "width": 340,
+        "color": 6
+      },
+      "id": "sticky-render",
+      "name": "Sticky — Render",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [840, 340]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+                "conditions": [
+                  {
+                    "id": "c-json2video",
+                    "leftValue": "={{ $json.motor }}",
+                    "rightValue": "json2video",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "json2video"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+                "conditions": [
+                  {
+                    "id": "c-remotion",
+                    "leftValue": "={{ $json.motor }}",
+                    "rightValue": "remotion",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "remotion"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "elegir-motor",
+      "name": "Elegir Motor",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [880, 220]
+    },
+    {
+      "parameters": {
+        "jsCode": "// TechNewsVertical v1: construye el movie JSON de JSON2Video desde el payload normalizado.\n// Edita aqui el estilo del video (fuentes, colores, tiempos). Referencia: json2video.com/docs\nconst p = $json;\nconst urls = (p.clips || []).map((c) => c.url).filter(Boolean);\nconst o = {\n  comment: 'TechNewsVertical v1 - Bot Contenido Local',\n  quality: 'high',\n  width: 1080,\n  height: 1920,\n  scenes: [],\n  elements: [\n    {\n      type: 'subtitles',\n      language: 'es',\n      model: 'default',\n      settings: {\n        style: 'classic-one-word',\n        position: 'custom',\n        x: 540,\n        y: 1480,\n        'font-family': 'Oswald',\n        'font-size': 92,\n        'max-words-per-line': 1,\n        'all-caps': true,\n        'word-color': '#FFE900',\n        'line-color': '#FFFFFF',\n        'outline-color': '#000000',\n        'outline-width': 6,\n      },\n    },\n  ],\n};\n\n// Escena 1 - HOOK: b-roll con titular y badge de fuente (5s)\nconst hook = { comment: 'HOOK', elements: [] };\nif (urls.length > 0) {\n  hook.elements.push({ type: 'video', src: urls[0], resize: 'cover', position: 'center-center', duration: 5, muted: true, 'fade-in': 0.3 });\n}\nhook.elements.push(\n  { type: 'text', text: p.titulo, duration: 5, 'fade-in': 0.4, 'fade-out': 0.5, position: 'custom', x: 'center', y: '18%', width: '84%', 'z-index': 5,\n    settings: { 'font-family': 'Oswald', 'font-size': '76px', 'font-weight': '700', color: '#FFFFFF', 'text-align': 'center', 'background-color': 'rgba(10,10,20,0.60)', padding: '22px' } },\n  { type: 'text', text: p.fuente, duration: 5, start: 0.5, 'fade-in': 0.4, position: 'custom', x: 'center', y: '33%', width: '40%', 'z-index': 6,\n    settings: { 'font-family': 'Roboto', 'font-size': '34px', 'font-weight': '500', color: '#0B0B0F', 'background-color': '#FFE900', 'text-align': 'center', padding: '8px 18px' } }\n);\no.scenes.push(hook);\n\n// Escena 2 - CUERPO: locucion completa; los subtitulos de la movie se sincronizan solos\nconst cuerpo = { comment: 'CUERPO', elements: [] };\nif (urls.length > 1) {\n  cuerpo.elements.push({ type: 'video', src: urls[1], resize: 'cover', position: 'center-center', duration: -2, muted: true, loop: -1 });\n}\ncuerpo.elements.push({ type: 'voice', voice: p.voz, model: 'azure', text: p.guion, 'extra-time': 1.2 });\no.scenes.push(cuerpo);\n\n// Escena 3 - CTA: cierre con hashtags (3s)\nconst cta = { comment: 'CTA', elements: [] };\nif (urls.length > 2) {\n  cta.elements.push({ type: 'video', src: urls[2], resize: 'cover', position: 'center-center', duration: 3, muted: true, 'fade-out': 0.6 });\n}\ncta.elements.push({ type: 'text', text: p.hashtags || 'Sigeme para mas #IA #tecnologia', duration: 3, 'fade-in': 0.3, position: 'custom', x: 'center', y: '72%', width: '86%', 'z-index': 5,\n  settings: { 'font-family': 'Oswald', 'font-size': '44px', 'font-weight': '600', color: '#FFFFFF', 'text-align': 'center' } });\no.scenes.push(cta);\n\nreturn [{ json: { ...p, movie: o } }];"
+      },
+      "id": "construir-movie-json",
+      "name": "Construir Movie JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1140, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.json2video.com/v2/movies",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{ $env.JSON2VIDEO_API_KEY }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.movie }}",
+        "options": {}
+      },
+      "id": "j2v-render",
+      "name": "JSON2Video: Enviar Render",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1140, 60]
+    },
+    {
+      "parameters": {
+        "resume": "timeInterval",
+        "amount": 20,
+        "unit": "seconds"
+      },
+      "id": "esperar-20s",
+      "name": "Esperar 20s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1360, 60],
+      "webhookId": "wait-render-loop"
+    },
+    {
+      "parameters": {
+        "url": "https://api.json2video.com/v2/movies",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "project", "value": "={{ $('JSON2Video: Enviar Render').first().json.project }}" }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{ $env.JSON2VIDEO_API_KEY }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "j2v-estado",
+      "name": "JSON2Video: Estado",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1580, 60]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose", "version": 2 },
+          "conditions": [
+            {
+              "id": "cond-done",
+              "leftValue": "={{ $json.movie.status }}",
+              "rightValue": "done",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "render-ok",
+      "name": "¿Render OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1800, 60]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose", "version": 2 },
+          "conditions": [
+            {
+              "id": "cond-error",
+              "leftValue": "={{ $json.movie.status }}",
+              "rightValue": "error",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "render-error",
+      "name": "¿Error Real?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [2020, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:3001/render",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { id: $json.id, guion: $json.guion, voz: $json.voz, plantilla: 'TechNewsVertical', clips: $json.clips, formato: '1080x1920' } }}",
+        "options": {}
+      },
+      "id": "remotion-render",
+      "name": "Remotion Local: Render",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1140, 420]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.movie ? $json.movie.url : $json.video_url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "id": "descargar-video",
+      "name": "Descargar Vídeo",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2280, 60]
+    },
+    {
+      "parameters": {
+        "content": "## 📣 AVISO\nTelegram envía el MP4 terminado al chat configurado en $env.TELEGRAM_CHAT_ID.\nCredencial: token del bot (nodo Telegram).\n\nLa publicación (YouTube/TikTok/IG) va en un workflow aparte — Fase 3.",
+        "height": 220,
+        "width": 320,
+        "color": 3
+      },
+      "id": "sticky-aviso",
+      "name": "Sticky — Aviso",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [2440, 220]
+    },
+    {
+      "parameters": {
+        "operation": "sendDocument",
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "binaryData": true,
+        "binaryPropertyName": "data",
+        "additionalFields": {
+          "caption": "=✅ Vídeo listo: {{ $('Normalizar Payload').first().json.titulo }}\nFuente: {{ $('Normalizar Payload').first().json.fuente }}"
+        }
+      },
+      "id": "telegram-listo",
+      "name": "Telegram: Vídeo Listo",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [2500, 60],
+      "credentials": {
+        "telegramApi": {
+          "id": null,
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $env.TELEGRAM_CHAT_ID }}",
+        "text": "=❌ Render falló para {{ $('Normalizar Payload').first().json.id }}: {{ $json.movie ? $json.movie.message : 'error desconocido' }}",
+        "additionalFields": {}
+      },
+      "id": "telegram-fallo",
+      "name": "Telegram: Fallo",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [2240, 220],
+      "credentials": {
+        "telegramApi": {
+          "id": null,
+          "name": "Telegram Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Bot Contenido": {
+      "main": [
+        [{ "node": "Normalizar Payload", "type": "main", "index": 0 }]
+      ]
+    },
+    "Normalizar Payload": {
+      "main": [
+        [
+          { "node": "Aceptar (HTTP 200)", "type": "main", "index": 0 },
+          { "node": "Pexels: Buscar B-Roll", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Pexels: Buscar B-Roll": {
+      "main": [
+        [{ "node": "Seleccionar Clips", "type": "main", "index": 0 }]
+      ]
+    },
+    "Seleccionar Clips": {
+      "main": [
+        [{ "node": "Elegir Motor", "type": "main", "index": 0 }]
+      ]
+    },
+    "Elegir Motor": {
+      "main": [
+        [{ "node": "Construir Movie JSON", "type": "main", "index": 0 }],
+        [{ "node": "Remotion Local: Render", "type": "main", "index": 0 }]
+      ]
+    },
+    "Construir Movie JSON": {
+      "main": [
+        [{ "node": "JSON2Video: Enviar Render", "type": "main", "index": 0 }]
+      ]
+    },
+    "JSON2Video: Enviar Render": {
+      "main": [
+        [{ "node": "Esperar 20s", "type": "main", "index": 0 }]
+      ]
+    },
+    "Esperar 20s": {
+      "main": [
+        [{ "node": "JSON2Video: Estado", "type": "main", "index": 0 }]
+      ]
+    },
+    "JSON2Video: Estado": {
+      "main": [
+        [{ "node": "¿Render OK?", "type": "main", "index": 0 }]
+      ]
+    },
+    "¿Render OK?": {
+      "main": [
+        [{ "node": "Descargar Vídeo", "type": "main", "index": 0 }],
+        [{ "node": "¿Error Real?", "type": "main", "index": 0 }]
+      ]
+    },
+    "¿Error Real?": {
+      "main": [
+        [{ "node": "Telegram: Fallo", "type": "main", "index": 0 }],
+        [{ "node": "Esperar 20s", "type": "main", "index": 0 }]
+      ]
+    },
+    "Remotion Local: Render": {
+      "main": [
+        [{ "node": "Descargar Vídeo", "type": "main", "index": 0 }]
+      ]
+    },
+    "Descargar Vídeo": {
+      "main": [
+        [{ "node": "Telegram: Vídeo Listo", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
