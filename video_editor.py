@@ -1,7 +1,8 @@
-"""Vídeos cortos 9:16 a partir de las noticias guardadas en output/.
+"""Montaje de Shorts con FFmpeg: borde limpio, fundido y zoom lento.
 
-El guión se adapta al español con reglas locales (frases y palabras), sin API
-de traducción. La voz sale de edge-tts y el montaje de moviepy. Coste: 0.
+El guión se adapta al español con reglas locales. La voz sale de edge-tts
+al +15 %. FFmpeg quema los subtítulos, funde las fotos y aplica un Ken Burns
+muy lento sobre el fondo de assets/backgrounds/.
 """
 
 from __future__ import annotations
@@ -12,22 +13,25 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from io import BytesIO
 from pathlib import Path
 
 import edge_tts
-import numpy as np
-from moviepy import AudioFileClip, VideoClip, VideoFileClip
-from moviepy.video.fx import Loop
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 BACKGROUNDS_DIR = BASE_DIR / "assets" / "backgrounds"
+BROLL_DIR = OUTPUT_DIR / "broll"
 TEST_AUDIO = OUTPUT_DIR / "audio_test.mp3"
 TEST_VIDEO = OUTPUT_DIR / "video_test.mp4"
 LATEST_VIDEO = OUTPUT_DIR / "latest_video.mp4"
@@ -37,9 +41,20 @@ _TICKS_PER_SECOND = 10_000_000
 
 # Voz neuronal en español de España. Alternativa: es-MX-JorgeNeural.
 DEFAULT_VOICE = "es-ES-AlvaroNeural"
+# Ritmo de noticia rápida. edge-tts acepta porcentajes como "+15%".
+DEFAULT_RATE = "+15%"
 FRAME_SIZE = (1080, 1920)
 FPS = 24
-_FONT_CACHE: dict[tuple[int, bool], ImageFont.ImageFont] = {}
+BROLL_COUNT = 3
+KEN_BURNS_ZOOM = 0.06
+FADE_SECONDS = 0.4
+STROKE_PX = 4
+# Amarillo #FFFF00 en el orden BGR que usa el formato ASS.
+ACTIVE_ASS = "00FFFF"
+_IMAGE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
 
 
 @dataclass(frozen=True)
@@ -117,6 +132,35 @@ _PHRASES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
         (r"you need to know", "que tienes que saber"),
     )
 )
+
+# Palabras que se pintan en verde neón. El resto queda en blanco.
+_IMPACT_WORDS = {
+    "alerta",
+    "ahora",
+    "bomba",
+    "censura",
+    "colapsa",
+    "crisis",
+    "estragos",
+    "explotaron",
+    "fallo",
+    "fallos",
+    "filtra",
+    "hackers",
+    "inteligencia",
+    "masiva",
+    "millones",
+    "nunca",
+    "parcheadas",
+    "peligro",
+    "prohibido",
+    "rompe",
+    "secreto",
+    "urgente",
+    "viral",
+    "vulnerabilidades",
+}
+
 
 _WORDS = {
     "a": "un",
@@ -417,7 +461,12 @@ async def synthesize(
         raise ValueError("El guión está vacío.")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    communicate = edge_tts.Communicate(script, voice, boundary="WordBoundary")
+    communicate = edge_tts.Communicate(
+        script,
+        voice,
+        rate=DEFAULT_RATE,
+        boundary="WordBoundary",
+    )
     audio = bytearray()
     cues: list[CaptionCue] = []
     async for message in communicate.stream():
@@ -449,61 +498,19 @@ def generate_audio(
     return asyncio.run(synthesize(text, destination, voice))
 
 
-def _font(size: int, bold: bool = False) -> ImageFont.ImageFont:
-    key = (size, bold)
-    cached = _FONT_CACHE.get(key)
-    if cached is not None:
-        return cached
-    windir = Path(os.environ.get("WINDIR", r"C:\Windows"))
-    filename = "arialbd.ttf" if bold else "arial.ttf"
-    path = windir / "Fonts" / filename
-    font = ImageFont.truetype(str(path), size=size) if path.is_file() else ImageFont.load_default()
-    _FONT_CACHE[key] = font
-    return font
+def _plain_word(word: str) -> str:
+    return re.sub(r"[^\wáéíóúñü]+", "", word, flags=re.IGNORECASE).casefold()
 
 
-def _wrap(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, width: int) -> list[str]:
-    lines: list[str] = []
-    current = ""
-    for word in text.split():
-        trial = word if not current else f"{current} {word}"
-        if draw.textlength(trial, font=font) <= width:
-            current = trial
-            continue
-        if current:
-            lines.append(current)
-        current = word
-    if current:
-        lines.append(current)
-    return lines
-
-
-def _text_overlay(title: str, source: str) -> np.ndarray:
-    """Cartel fijo: rótulo arriba y fuente abajo. El centro queda para los subtítulos."""
-    width, height = FRAME_SIZE
-    image = Image.new("RGBA", FRAME_SIZE, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-    margin = 90
-    title_font = _font(44, bold=True)
-    kicker_font = _font(34, bold=True)
-    source_font = _font(36, bold=True)
-
-    draw.text((margin, 140), "NOTICIA IA", font=kicker_font, fill=(120, 230, 214, 255))
-    for offset, line in enumerate(_wrap(draw, title, title_font, width - margin * 2)[:2]):
-        y = 210 + offset * 58
-        draw.text((margin + 2, y + 2), line, font=title_font, fill=(0, 0, 0, 160))
-        draw.text((margin, y), line, font=title_font, fill=(255, 255, 255, 255))
-
-    label = source or "Tecnología"
-    pill_width = int(draw.textlength(label, font=source_font)) + 64
-    pill = (margin, height - 250, margin + pill_width, height - 170)
-    draw.rounded_rectangle(pill, radius=28, fill=(8, 16, 32, 180))
-    draw.text((margin + 32, height - 232), label, font=source_font, fill=(255, 255, 255, 255))
-    return np.array(image)
+def _is_impact(word: str) -> bool:
+    token = _plain_word(word)
+    if token in _IMPACT_WORDS:
+        return True
+    return any(character.isdigit() for character in word)
 
 
 def _phrase_groups(cues: list[CaptionCue]) -> dict[int, list[int]]:
-    """Agrupa las palabras en frases cortas y devuelve el grupo de cada índice."""
+    """Hasta tres palabras por línea, el corte corto de los subtítulos de CapCut."""
     groups: list[list[int]] = []
     bucket: list[int] = []
     for index, cue in enumerate(cues):
@@ -530,102 +537,266 @@ def _cue_at(cues: list[CaptionCue], moment: float) -> int:
     return found
 
 
-def _draw_outlined(
-    draw: ImageDraw.ImageDraw,
-    position: tuple[int, int],
-    text: str,
-    font: ImageFont.ImageFont,
-    fill: tuple[int, int, int, int],
-) -> None:
-    x, y = position
-    for dx, dy in ((-3, 0), (3, 0), (0, -3), (0, 3), (-2, -2), (2, 2), (-2, 2), (2, -2)):
-        draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0, 230))
-    draw.text((x, y), text, font=font, fill=fill)
+# token del audio -> (nombre de archivo, búsqueda en inglés para fotos de stock)
+_BROLL_QUERIES = {
+    "hackers": ("hackers", "hacker server room pexels"),
+    "hacker": ("hackers", "hacker server room pexels"),
+    "php": ("php", "programming code screen pexels"),
+    "php2shell": ("php", "programming code screen pexels"),
+    "amazon": ("aws", "data center servers pexels"),
+    "aws": ("aws", "data center servers pexels"),
+    "internet": ("internet", "fiber optic cables pexels"),
+    "vulnerabilidades": ("security", "cyber security digital lock"),
+    "vulnerabilidad": ("security", "cyber security digital lock"),
+    "explotaron": ("attack", "cyber attack on a computer"),
+    "explotando": ("attack", "cyber attack on a computer"),
+    "estragos": ("servers", "server room lights"),
+    "fallos": ("bug", "software code on a monitor"),
+    "fallo": ("bug", "software code on a monitor"),
+    "openai": ("ai", "artificial intelligence technology"),
+    "chatgpt": ("ai", "artificial intelligence technology"),
+    "inteligencia": ("ai", "artificial intelligence technology"),
+    "nvidia": ("chip", "computer gpu chip close up"),
+    "google": ("google", "data center servers"),
+    "microsoft": ("software", "software developer at a computer"),
+    "apple": ("phone", "smartphone in hand close up"),
+    "meta": ("social", "person using a smartphone social media"),
+    "anthropic": ("ai", "artificial intelligence technology"),
+    "claude": ("ai", "artificial intelligence technology"),
+}
 
 
-def _caption_strip(cues: list[CaptionCue], active: int, groups: dict[int, list[int]]) -> np.ndarray:
-    """Frase corta centrada. La palabra que suena va en amarillo y un poco más alta."""
-    width = FRAME_SIZE[0]
-    height = 520
-    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-    normal = _font(64, bold=True)
-    active_font = _font(80, bold=True)
-    group = groups.get(active, [active])
-    gap = 22
-    max_width = width - 140
+@dataclass
+class BrollShot:
+    """Una foto de apoyo y el tramo del audio en el que se muestra."""
 
-    lines: list[list[tuple[str, ImageFont.ImageFont, bool, float]]] = [[]]
-    line_width = 0.0
-    for index in group:
-        word = cues[index].text
-        is_active = index == active
-        font = active_font if is_active else normal
-        word_width = float(draw.textlength(word, font=font))
-        if lines[-1] and line_width + gap + word_width > max_width:
-            lines.append([])
-            line_width = 0.0
-        if lines[-1]:
-            line_width += gap
-        lines[-1].append((word, font, is_active, word_width))
-        line_width += word_width
+    token: str
+    query: str
+    start: float
+    end: float
+    path: Path
+    provider: str
 
-    line_height = 110
-    block_height = len(lines) * line_height
-    top = max(20, (height - block_height) // 2)
-    for line_index, line in enumerate(lines):
-        used = sum(item[3] for item in line) + gap * (len(line) - 1)
-        x = int((width - used) / 2)
-        y = top + line_index * line_height
-        pad = 24
-        draw.rounded_rectangle(
-            (x - pad, y - 8, x + used + pad, y + 92),
-            radius=22,
-            fill=(6, 10, 24, 150),
+
+def _broll_choice(word: str) -> tuple[str, str] | None:
+    token = _plain_word(word)
+    if token.startswith("php"):
+        token = "php"
+    return _BROLL_QUERIES.get(token)
+
+
+def _caption_label(word: str) -> str:
+    cleaned = re.sub(r"^[^\wáéíóúñü]+|[^\wáéíóúñü]+$", "", word, flags=re.IGNORECASE)
+    return (cleaned or word).upper()
+
+
+def _pexels_urls(query: str) -> list[str]:
+    api_key = os.environ.get("PEXELS_API_KEY", "").strip()
+    if not api_key:
+        return []
+    url = "https://api.pexels.com/v1/search?" + urllib.parse.urlencode(
+        {"query": query, "per_page": "6", "orientation": "portrait"}
+    )
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": api_key, "User-Agent": _IMAGE_UA},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        print(f"Pexels no respondió: {exc}", file=sys.stderr)
+        return []
+    urls: list[str] = []
+    for photo in payload.get("photos") or []:
+        src = photo.get("src") or {}
+        image = src.get("portrait") or src.get("large2x") or src.get("large")
+        if image:
+            urls.append(str(image))
+    return urls
+
+
+_CLEAN_HOSTS = (
+    "images.pexels.com",
+    "images.unsplash.com",
+    "cdn.pixabay.com",
+    "upload.wikimedia.org",
+)
+_BLOCKED_HOSTS = (
+    "freepik",
+    "dreamstime",
+    "vecteezy",
+    "ftcdn",
+    "alamy",
+    "shutterstock",
+    "istock",
+    "gettyimages",
+    "123rf",
+    "pngtree",
+    "lovepik",
+    "depositphotos",
+    "bigstock",
+    "plus.unsplash",
+    "magnific",
+)
+
+
+def _usable_image_url(url: str) -> bool:
+    host = urllib.parse.urlparse(url).netloc.casefold()
+    if any(blocked in host for blocked in _BLOCKED_HOSTS):
+        return False
+    return url.startswith("http")
+
+
+def _rank_image_url(url: str) -> int:
+    host = urllib.parse.urlparse(url).netloc.casefold()
+    for index, clean in enumerate(_CLEAN_HOSTS):
+        if clean in host:
+            return index
+    return len(_CLEAN_HOSTS)
+
+
+def _ddg_urls(query: str) -> list[str]:
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        print("Falta el paquete ddgs. Instálalo con pip install ddgs.", file=sys.stderr)
+        return []
+    collected: list[str] = []
+    for variant in (query, f"{query} pexels"):
+        try:
+            results = DDGS().images(variant, max_results=8, safesearch="moderate")
+        except Exception as exc:
+            print(f"DuckDuckGo no respondió para {variant!r}: {exc}", file=sys.stderr)
+            continue
+        for item in results:
+            image = str(item.get("image") or "")
+            if _usable_image_url(image):
+                collected.append(image)
+    unique = list(dict.fromkeys(collected))
+    unique.sort(key=_rank_image_url)
+    return unique[:8]
+
+
+def _download_image(urls: list[str], destination: Path) -> bool:
+    for url in urls:
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": _IMAGE_UA, "Referer": "https://duckduckgo.com/"},
         )
-        for word, font, is_active, word_width in line:
-            word_y = y - 10 if is_active else y
-            fill = (255, 224, 64, 255) if is_active else (255, 255, 255, 255)
-            _draw_outlined(draw, (int(x), word_y), word, font, fill)
-            x += int(word_width) + gap
-    return np.array(image)
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                data = response.read(8_000_000)
+            image = Image.open(BytesIO(data)).convert("RGB")
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            continue
+        if min(image.size) < 280:
+            continue
+        image.thumbnail((1400, 1600), Image.Resampling.LANCZOS)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        image.save(destination, "JPEG", quality=88)
+        return True
+    return False
 
 
-def _background_frame(t: float, duration: float) -> np.ndarray:
-    """Gradiente vertical que cambia de color y una barra que recorre la pantalla."""
-    width, height = FRAME_SIZE
-    phase = (t / duration) if duration else 0.0
-    phase = min(max(phase, 0.0), 1.0)
-    blend = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None, None]
-    shift = 0.12 * np.sin(phase * 6.28318)
-    blend = np.clip(blend + shift, 0.0, 1.0)
-    top = np.array([8, 16, 42], dtype=np.float32)
-    bottom = np.array([14, 78, 112], dtype=np.float32) * (1.0 - phase) + np.array(
-        [86, 28, 92], dtype=np.float32
-    ) * phase
-    gradient = top * (1.0 - blend) + bottom * blend
-    frame = np.broadcast_to(gradient, (height, width, 3)).copy()
-    bar_y = int((0.08 + 0.84 * phase) * (height - 10))
-    frame[bar_y : bar_y + 8, :, :] = (90, 230, 210)
-    return frame
+def _image_file_ok(path: Path) -> bool:
+    if not path.is_file() or path.stat().st_size < 5000:
+        return False
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        return True
+    except (OSError, ValueError):
+        return False
 
 
-def _blit(frame: np.ndarray, overlay: np.ndarray, y: int = 0, x: int = 0) -> np.ndarray:
-    """Pega una capa RGBA sobre un fotograma RGB."""
-    frame = np.ascontiguousarray(frame)
-    overlay_h, overlay_w = overlay.shape[:2]
-    y2 = min(y + overlay_h, frame.shape[0])
-    x2 = min(x + overlay_w, frame.shape[1])
-    height = y2 - y
-    width = x2 - x
-    if height <= 0 or width <= 0:
-        return frame
-    patch = overlay[:height, :width]
-    alpha = patch[..., 3:4].astype(np.float32) / 255.0
-    color = patch[..., :3].astype(np.float32)
-    region = frame[y:y2, x:x2].astype(np.float32)
-    frame[y:y2, x:x2] = np.clip(region * (1.0 - alpha) + color * alpha, 0, 255).astype(np.uint8)
-    return frame
+def _save_broll_image(token: str, query: str) -> tuple[Path, str] | None:
+    path = BROLL_DIR / f"{token}.jpg"
+    if _image_file_ok(path):
+        return path, "caché"
+    pexels = _pexels_urls(query)
+    if pexels and _download_image(pexels, path) and _image_file_ok(path):
+        return path, "Pexels"
+    if _download_image(_ddg_urls(query), path) and _image_file_ok(path):
+        return path, "DuckDuckGo"
+    print(f"Sin foto para {token} ({query}).", file=sys.stderr)
+    return None
+
+
+# Temas con foto clara. El resto solo rellena si la noticia no nombra a ninguno.
+_BROLL_PRIMARY = {
+    "hackers",
+    "php",
+    "aws",
+    "internet",
+    "ai",
+    "chip",
+    "google",
+    "software",
+    "phone",
+    "social",
+}
+
+
+def extract_broll_keywords(cues: list[CaptionCue]) -> list[tuple[str, str]]:
+    """Hasta 3 temas, primero los nombres concretos y en orden de narración."""
+    primary: list[tuple[str, str]] = []
+    extra: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for cue in cues:
+        choice = _broll_choice(cue.text)
+        if choice is None or choice[0] in seen:
+            continue
+        seen.add(choice[0])
+        if choice[0] in _BROLL_PRIMARY:
+            primary.append(choice)
+        else:
+            extra.append(choice)
+    chosen = primary[:BROLL_COUNT]
+    if len(chosen) < 2:
+        for choice in extra:
+            if choice[0] in {token for token, _query in chosen}:
+                continue
+            chosen.append(choice)
+            if len(chosen) >= BROLL_COUNT:
+                break
+    return chosen
+
+
+def fetch_broll(cues: list[CaptionCue]) -> list[BrollShot]:
+    """Descarga las fotos y las reparte en el tiempo de la narración."""
+    chosen = extract_broll_keywords(cues)
+    if not chosen or not cues:
+        return []
+    starts: list[tuple[float, str, str]] = []
+    for token, query in chosen:
+        for cue in cues:
+            choice = _broll_choice(cue.text)
+            if choice is not None and choice[0] == token:
+                starts.append((cue.start, token, query))
+                break
+    shots: list[BrollShot] = []
+    last_end = cues[-1].end
+    for index, (start, token, query) in enumerate(starts):
+        saved = _save_broll_image(token, query)
+        if saved is None:
+            continue
+        path, provider = saved
+        end = starts[index + 1][0] if index + 1 < len(starts) else max(last_end, start + 1.5)
+        if end <= start:
+            end = start + 1.2
+        print(f"B-roll {token}: {query} ({provider})")
+        shots.append(
+            BrollShot(
+                token=token,
+                query=query,
+                start=start,
+                end=end,
+                path=path,
+                provider=provider,
+            )
+        )
+    return shots
 
 
 def list_backgrounds(folder: Path = BACKGROUNDS_DIR) -> list[Path]:
@@ -634,28 +805,242 @@ def list_backgrounds(folder: Path = BACKGROUNDS_DIR) -> list[Path]:
     return sorted(path for path in folder.glob("*.mp4") if path.is_file())
 
 
-def pick_background(folder: Path = BACKGROUNDS_DIR) -> Path | None:
+def pick_background(folder: Path = BACKGROUNDS_DIR) -> Path:
+    """Elige un clip al azar. Sin un .mp4 en la carpeta no hay vídeo."""
     clips = list_backgrounds(folder)
     if not clips:
-        return None
+        raise FileNotFoundError(
+            f"Hace falta al menos un .mp4 en {folder}. "
+            "Copia ahí el vídeo de fondo y vuelve a lanzar el editor."
+        )
     return random.choice(clips)
 
 
-def _cover_vertical(clip: VideoFileClip, duration: float) -> VideoFileClip:
-    """Escala el clip hasta cubrir 9:16, lo recorta al centro y lo ajusta al audio."""
-    target_w, target_h = FRAME_SIZE
-    clip_w, clip_h = clip.size
-    scale = max(target_w / clip_w, target_h / clip_h)
-    resized = clip.resized(new_size=(int(clip_w * scale), int(clip_h * scale))).without_audio()
-    resized_w, resized_h = resized.size
-    x1 = max(0, (resized_w - target_w) // 2)
-    y1 = max(0, (resized_h - target_h) // 2)
-    covered = resized.cropped(x1=x1, y1=y1, width=target_w, height=target_h)
-    if covered.duration + 0.05 < duration:
-        covered = covered.with_effects([Loop(duration=duration)])
-    if covered.duration > duration:
-        covered = covered.subclipped(0, duration)
-    return covered
+def sync_cues(cues: list[CaptionCue]) -> list[CaptionCue]:
+    """Recorta cada palabra para que su intervalo no pise el de la siguiente."""
+    ordered = sorted(cues, key=lambda cue: (cue.start, cue.end))
+    synced: list[CaptionCue] = []
+    for cue in ordered:
+        start = max(0.0, cue.start)
+        end = cue.end
+        if synced and start < synced[-1].end:
+            previous = synced[-1]
+            if start <= previous.start:
+                continue
+            synced[-1] = CaptionCue(previous.text, previous.start, start)
+        if end <= start:
+            end = start + 0.04
+        synced.append(CaptionCue(cue.text, start, end))
+    tightened: list[CaptionCue] = []
+    for index, cue in enumerate(synced):
+        end = cue.end
+        if index + 1 < len(synced):
+            end = min(end, synced[index + 1].start)
+        if end <= cue.start:
+            end = cue.start + 0.04
+        tightened.append(CaptionCue(cue.text, cue.start, end))
+    return tightened
+
+
+def _snap_time(seconds: float) -> float:
+    return round(max(0.0, seconds), 2)
+
+
+def _ass_clock(seconds: float) -> str:
+    total = int(round(max(0.0, seconds) * 100))
+    centis = total % 100
+    total //= 100
+    secs = total % 60
+    total //= 60
+    minutes = total % 60
+    hours = total // 60
+    return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
+
+
+def _ass_word(word: str) -> str:
+    label = _caption_label(word)
+    return label.replace("\\", "").replace("{", "").replace("}", "")
+
+
+def _phrase_text(words: list[str], active: int | None) -> str:
+    chunks: list[str] = []
+    for index, word in enumerate(words):
+        label = _ass_word(word)
+        if not label:
+            continue
+        if index == active:
+            chunks.append("{\\c&H" + ACTIVE_ASS + "&}" + label + "{\\c&HFFFFFF&}")
+        else:
+            chunks.append(label)
+    return "{\\q2}" + " ".join(chunks)
+
+
+def _caption_events(cues: list[CaptionCue]) -> list[tuple[float, float, str]]:
+    """Un evento por palabra. El hueco entre medias queda en blanco, sin solaparse."""
+    groups = _phrase_groups(cues)
+    raw: list[tuple[float, float, str]] = []
+    for index, cue in enumerate(cues):
+        group = groups.get(index, [index])
+        words = [cues[item].text for item in group]
+        offset = group.index(index)
+        raw.append((cue.start, cue.end, _phrase_text(words, offset)))
+        if index + 1 < len(cues):
+            gap = cues[index + 1].start - cue.end
+            if gap > 0.02:
+                raw.append((cue.end, cues[index + 1].start, _phrase_text(words, None)))
+    events: list[tuple[float, float, str]] = []
+    for start, end, text in raw:
+        start = _snap_time(start)
+        end = _snap_time(end)
+        if events and start < events[-1][1]:
+            previous_start, _previous_end, previous_text = events[-1]
+            events[-1] = (previous_start, start, previous_text)
+        if end <= start:
+            end = round(start + 0.04, 2)
+        events.append((start, end, text))
+    for index in range(1, len(events)):
+        if events[index][0] < events[index - 1][1]:
+            raise RuntimeError("Los subtítulos se solapan después de ajustarlos.")
+    return events
+
+
+def write_captions(cues: list[CaptionCue], source: str, duration: float, destination: Path) -> Path:
+    """ASS con borde y sombra. BorderStyle 1 no dibuja una caja opaca."""
+    events = _caption_events(cues) if cues else []
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {FRAME_SIZE[0]}",
+        f"PlayResY: {FRAME_SIZE[1]}",
+        "ScaledBorderAndShadow: yes",
+        "WrapStyle: 2",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        "Style: Caption,Arial Black,72,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+        "-1,0,0,0,100,100,1,0,1,4,3,5,70,70,0,1",
+        "Style: Credit,Arial Black,32,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+        "0,0,0,0,100,100,0,0,1,3,1,2,40,40,72,1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    for start, end, text in events:
+        lines.append(
+            f"Dialogue: 0,{_ass_clock(start)},{_ass_clock(end)},Caption,,0,0,0,,{text}"
+        )
+    credit = _ass_word(source)
+    if credit:
+        lines.append(
+            f"Dialogue: 1,{_ass_clock(0)},{_ass_clock(duration)},Credit,,0,0,0,,{credit}"
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+    return destination
+
+
+def _ffmpeg_exe() -> str:
+    import imageio_ffmpeg
+
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def _media_duration(path: Path) -> float:
+    result = subprocess.run(
+        [_ffmpeg_exe(), "-hide_banner", "-i", str(path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
+    if match is None:
+        raise RuntimeError(f"No se pudo leer la duración de {path.name}.")
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def _filter_path(path: Path) -> str:
+    text = path.resolve().as_posix().replace("\\", "/")
+    return text.replace(":", "\\:").replace("'", "\\'")
+
+
+def _zoom_scale(amount: str) -> str:
+    width, height = FRAME_SIZE
+    return (
+        f"scale=w='trunc({width}*(1+({amount}))/2)*2':"
+        f"h='trunc({height}*(1+({amount}))/2)*2':eval=frame,"
+        f"crop={width}:{height}"
+    )
+
+
+def _shot_window(index: int, shots: list[BrollShot], duration: float) -> tuple[float, float, float]:
+    shot = shots[index]
+    span = max(shot.end - shot.start, 0.24)
+    fade = min(FADE_SECONDS, span / 3)
+    start = shot.start
+    end = min(duration, shot.end)
+    if index > 0 and shot.start - shots[index - 1].end <= 0.08:
+        start = max(0.0, shot.start - fade / 2)
+    if index + 1 < len(shots) and shots[index + 1].start - shot.end <= 0.08:
+        end = min(duration, shot.end + fade / 2)
+    fade = min(FADE_SECONDS, max(0.12, (end - start) / 3))
+    return start, end, fade
+
+
+def _filter_graph(
+    shots: list[BrollShot],
+    captions: Path,
+    duration: float,
+) -> str:
+    width, height = FRAME_SIZE
+    background_zoom = f"{KEN_BURNS_ZOOM:.4f}*t/{duration:.3f}"
+    parts = [
+        (
+            f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},fps={FPS},setsar=1,"
+            f"{_zoom_scale(background_zoom)},"
+            f"fade=t=in:st=0:d={FADE_SECONDS:.2f},"
+            f"eq=brightness=-0.04:saturation=1.06,format=yuv420p[base0]"
+        )
+    ]
+    previous = "base0"
+    for index, shot in enumerate(shots):
+        start, end, fade = _shot_window(index, shots, duration)
+        span = max(shot.end - shot.start, 0.24)
+        amount = f"0.0500*max(t-{shot.start:.3f}\\,0)/{span:.3f}"
+        fade_out = max(start, end - fade)
+        parts.append(
+            f"[{index + 1}:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},fps={FPS},setsar=1,"
+            f"{_zoom_scale(amount)},format=yuva420p,"
+            f"fade=t=in:st={start:.3f}:d={fade:.3f}:alpha=1,"
+            f"fade=t=out:st={fade_out:.3f}:d={fade:.3f}:alpha=1[img{index}]"
+        )
+        parts.append(
+            f"[{previous}][img{index}]overlay=0:0:"
+            f"enable='between(t,{start:.3f},{end:.3f})'[base{index + 1}]"
+        )
+        previous = f"base{index + 1}"
+    fonts = _filter_path(Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts")
+    subtitles = _filter_path(captions)
+    parts.append(f"[{previous}]ass=filename='{subtitles}':fontsdir='{fonts}'[vout]")
+    return ";\n".join(parts)
+
+
+def _run_ffmpeg(command: list[str]) -> None:
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        tail = "\n".join((result.stderr or "").splitlines()[-30:])
+        raise RuntimeError(f"ffmpeg falló:\n{tail}")
 
 
 def render_short(
@@ -666,66 +1051,66 @@ def render_short(
     cues: list[CaptionCue],
     script: str = "",
     background_path: Path | None = None,
+    broll: list[BrollShot] | None = None,
 ) -> Path:
-    """Monta el mp3 sobre un fondo 1080x1920, con subtítulos palabra a palabra."""
+    """FFmpeg: fondo con Ken Burns, fotos en fundido y subtítulos solo con borde."""
+    del title
+    if background_path is None:
+        background_path = pick_background()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    audio = AudioFileClip(str(audio_path))
-    duration = float(audio.duration)
+    duration = _media_duration(audio_path)
     if not cues:
         cues = _even_cues(script, duration)
-    groups = _phrase_groups(cues) if cues else {}
-    chrome = _text_overlay(title, source)
-    caption_cache: dict[int, np.ndarray] = {}
-    caption_top = (FRAME_SIZE[1] - 520) // 2
-    raw_background = None
-    background = None
-    if background_path is not None:
-        raw_background = VideoFileClip(str(background_path))
-        background = _cover_vertical(raw_background, duration)
-
-    def make_frame(t: float) -> np.ndarray:
-        moment = min(max(float(t), 0.0), max(duration - (1 / FPS), 0.0))
-        if background is not None:
-            frame = background.get_frame(min(moment, max(background.duration - (1 / FPS), 0.0)))
-            frame = np.ascontiguousarray(frame)
-            if frame.dtype != np.uint8:
-                frame = np.clip(frame, 0, 255).astype(np.uint8)
-            if frame.ndim == 3 and frame.shape[2] == 4:
-                frame = frame[..., :3]
-        else:
-            frame = _background_frame(moment, duration)
-        frame = _blit(frame, chrome, 0, 0)
-        if not cues:
-            return frame
-        active = _cue_at(cues, moment)
-        strip = caption_cache.get(active)
-        if strip is None:
-            strip = _caption_strip(cues, active, groups)
-            caption_cache[active] = strip
-        return _blit(frame, strip, caption_top, 0)
-
-    video = VideoClip(make_frame, duration=duration).with_fps(FPS).with_audio(audio)
-    try:
-        video.write_videofile(
-            str(destination),
-            fps=FPS,
-            codec="libx264",
-            audio_codec="aac",
-            preset="ultrafast",
-            threads=2,
-            pixel_format="yuv420p",
-            logger="bar",
+    cues = sync_cues(cues)
+    if broll is None:
+        broll = fetch_broll(cues)
+    captions = write_captions(cues, source, duration, destination.with_name("captions.ass"))
+    filter_path = destination.with_name("render_filter.txt")
+    filter_path.write_text(_filter_graph(broll, captions, duration), encoding="utf-8")
+    build = destination.with_name(destination.stem + "_build.mp4")
+    if build.exists():
+        build.unlink()
+    command = [_ffmpeg_exe(), "-y", "-stream_loop", "-1", "-i", str(background_path)]
+    for shot in broll:
+        command.extend(
+            ["-loop", "1", "-framerate", str(FPS), "-t", f"{duration:.3f}", "-i", str(shot.path)]
         )
-    finally:
-        video.close()
-        audio.close()
-        if background is not None:
-            background.close()
-        if raw_background is not None and raw_background is not background:
-            raw_background.close()
-
+    command.extend(
+        [
+            "-i",
+            str(audio_path),
+            "-filter_complex_script",
+            str(filter_path),
+            "-map",
+            "[vout]",
+            "-map",
+            f"{1 + len(broll)}:a:0",
+            "-t",
+            f"{duration:.3f}",
+            "-r",
+            str(FPS),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-movflags",
+            "+faststart",
+            str(build),
+        ]
+    )
+    print(f"Montaje FFmpeg: {duration:.1f}s, {len(cues)} palabras, {len(broll)} fotos")
+    _run_ffmpeg(command)
+    os.replace(build, destination)
     if not destination.is_file() or destination.stat().st_size == 0:
-        raise RuntimeError(f"moviepy no escribió el vídeo en {destination}.")
+        raise RuntimeError(f"ffmpeg no escribió el vídeo en {destination}.")
     return destination
 
 
@@ -749,7 +1134,9 @@ def render_news_video(
     if background_path is None:
         background_path = pick_background()
     audio, cues = generate_audio(script, audio_path)
+    cues = sync_cues(cues)
     title = _as_sentence(localize_to_spanish(str(article.get("title") or ""))).rstrip(".")
+    shots = fetch_broll(cues)
     video = render_short(
         audio,
         destination,
@@ -758,6 +1145,7 @@ def render_news_video(
         cues,
         script,
         background_path,
+        shots,
     )
     return {
         "script": script,
@@ -767,13 +1155,15 @@ def render_news_video(
         "background": str(background_path) if background_path else "",
         "source": article.get("source", ""),
         "source_file": article.get("source_file", ""),
+        "broll": [shot.token for shot in shots],
+        "broll_provider": [shot.provider for shot in shots],
     }
 
 
 def create_test_short() -> dict:
-    """Genera audio_test.mp3 y el vídeo vertical video_test.mp4."""
-    article = load_latest_article(TEST_AUDIO.parent)
-    return render_news_video(article, TEST_VIDEO, TEST_AUDIO)
+    """Genera la prueba en output/latest_video.mp4."""
+    article = load_latest_article(OUTPUT_DIR)
+    return render_news_video(article, LATEST_VIDEO, OUTPUT_DIR / "latest_audio.mp3")
 
 
 def _utf8_stdio() -> None:
@@ -789,8 +1179,9 @@ def _utf8_stdio() -> None:
 
 def main() -> int:
     _utf8_stdio()
-    print(f"Voz: {DEFAULT_VOICE}")
+    print(f"Voz: {DEFAULT_VOICE} a {DEFAULT_RATE}")
     print(f"Formato: {FRAME_SIZE[0]}x{FRAME_SIZE[1]}")
+    print("Motor: FFmpeg")
     try:
         result = create_test_short()
     except Exception as exc:
@@ -799,10 +1190,17 @@ def main() -> int:
 
     audio = result["audio"]
     video = result["video"]
+    names = result.get("broll") or []
+    providers = result.get("broll_provider") or []
+    broll_line = ", ".join(
+        f"{name} ({providers[index]})" if index < len(providers) else name
+        for index, name in enumerate(names)
+    ) or "ninguno"
     print(f"Fuente: {result['source']} ({result['source_file']})")
     print(f"Guión: {result['script']}")
     print(f"Palabras sincronizadas: {result['cues']}")
-    print(f"Fondo: {result['background'] or 'degradado generado'}")
+    print(f"B-roll: {broll_line}")
+    print(f"Fondo: {result['background']}")
     print(f"Audio: {audio} ({audio.stat().st_size} bytes)")
     print(f"Vídeo: {video} ({video.stat().st_size} bytes)")
     return 0

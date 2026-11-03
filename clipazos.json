@@ -1,0 +1,41 @@
+{
+  "canal": "Clipazos ES",
+  "idioma": "es",
+  "shorts_por_dia": 1,
+  "no_repetir_dias": 2,
+  "segundos_objetivo": 40,
+  "clips_maximos": 5,
+  "segundos_min_clip": 6,
+  "segundos_max_clip": 22,
+  "twitch": {
+    "juegos_top": 15,
+    "categorias_fijas": ["Just Chatting", "IRL"],
+    "categorias_excluidas": ["Slots", "Virtual Casino", "Pools, Hot Tubs, and Beaches", "ASMR"]
+  },
+  "kick": {
+    "streamers": ["westcol"],
+    "horas": 48,
+    "vistas_minimas": 50
+  },
+  "youtube": {
+    "canales": ["@TheGrefg"],
+    "horas": 48
+  },
+  "radar": {
+    "multiplicador": 2.0,
+    "vistas_minimas": 3000,
+    "dias_historial": 14
+  },
+  "semanal": {
+    "streamers": ["auronplay"],
+    "minutos": 20,
+    "contexto_antes": 50,
+    "contexto_despues": 30,
+    "union_segundos": 60,
+    "tramo_min_segundos": 90,
+    "tramo_max_segundos": 360,
+    "silencio_max_segundos": 10,
+    "vistas_minimas_vod": 300
+  },
+  "excluir_streamers": []
+}

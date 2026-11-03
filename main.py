@@ -196,7 +196,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Vídeo: {rendered['video']} ({rendered['video'].stat().st_size} bytes)")
     print(f"Audio: {rendered['audio']}")
     print(f"Palabras sincronizadas: {rendered['cues']}")
-    print(f"Fondo: {rendered['background'] or 'degradado generado'}")
+    print(f"Fondo: {rendered['background']}")
     return 0
 
 

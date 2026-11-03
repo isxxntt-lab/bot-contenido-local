@@ -9,3 +9,13 @@ moviepy>=2.1
 
 # Cliente webhook hacia n8n (render híbrido).
 requests>=2.31
+
+# Búsqueda de imágenes sin clave. Pexels se usa solo si existe PEXELS_API_KEY.
+ddgs>=9.0
+
+# Clipazos ES: localizar clips de Twitch, Kick y YouTube sin claves.
+yt-dlp>=2026.10
+
+# Clipazos ES: transcripción local con tiempos por palabra.
+faster-whisper>=1.2
+numpy>=2.0
