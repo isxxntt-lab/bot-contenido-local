@@ -79,6 +79,12 @@ NON_GAMES = {
 }
 
 VIDEO_TOP = (FRAME_SIZE[1] - FRAME_SIZE[0] * 9 // 16) // 2
+FACE_MODEL = BASE_DIR / "assets" / "models" / "face_detection_yunet_2023mar.onnx"
+SCAN_SIZE = (640, 360)
+SPLIT_TOP = 840
+FOLLOW_BOX = (1080, 1440)
+SOURCE_KEEP = 0.86
+INTRO_SECONDS = 3.0
 YELLOW = "{\\c&H" + ACTIVE_ASS + "&}"
 WHITE = "{\\c&HFFFFFF&}"
 
@@ -104,6 +110,20 @@ class Moment:
     length: float
     cues: list[CaptionCue]
     peak: float = 0.0
+    layout: Layout | None = None
+
+
+@dataclass
+class Layout:
+    """Cómo encajar el clip horizontal en el vertical.
+
+    kind: "split" (cámara arriba, juego abajo), "follow" (plano cerrado en la cara)
+    o "blur" (clip entero sobre fondo desenfocado). face va en coordenadas 0-1.
+    """
+
+    kind: str
+    aspect: float
+    face: tuple[float, float, float, float] | None = None
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict:
@@ -343,7 +363,7 @@ def fetch_media(candidate: Candidate) -> Path:
     destination = CACHE_DIR / f"{_safe_name(candidate.key)}.mp4"
     if destination.is_file() and destination.stat().st_size > 0:
         return destination
-    with _ytdlp({"format": "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720]/b"}) as downloader:
+    with _ytdlp({"format": "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]/b"}) as downloader:
         info = downloader.extract_info(candidate.url, download=False)
     formats = info.get("requested_formats") or [info]
     command = [_ffmpeg_exe(), "-y", "-v", "error"]
@@ -472,6 +492,85 @@ def choose_window(
     return start, span, max(0.0, local_peak)
 
 
+def _video_size(path: Path) -> tuple[int, int]:
+    result = subprocess.run(
+        [_ffmpeg_exe(), "-hide_banner", "-i", str(path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    match = re.search(r"Video:.*?(\d{3,5})x(\d{3,5})", result.stderr)
+    return (int(match[1]), int(match[2])) if match else (1280, 720)
+
+
+_DETECTOR = None
+
+
+def _face_detector():
+    global _DETECTOR
+    if _DETECTOR is None:
+        import cv2
+
+        _DETECTOR = cv2.FaceDetectorYN.create(str(FACE_MODEL), "", SCAN_SIZE, 0.7)
+    return _DETECTOR
+
+
+def detect_layout(path: Path, start: float, length: float) -> Layout:
+    """Busca la cara del streamer en el tramo (YuNet, local) y elige el formato.
+
+    La cara que más se repite es la del streamer; si hay dos cámaras gana la que
+    sale en más fotogramas. En el centro, la cámara ocupa la pantalla (follow).
+    En un lateral solo es una webcam superpuesta (split) si es pequeña, casi no
+    se mueve y hay una sola cara en esa zona; varias caras moviéndose por la
+    misma zona es un IRL con gente y se usa blur.
+    """
+    width, height = _video_size(path)
+    aspect = width / height
+    if not FACE_MODEL.is_file():
+        return Layout("blur", aspect)
+    scan_width, scan_height = SCAN_SIZE
+    raw = subprocess.run(
+        [_ffmpeg_exe(), "-v", "error", "-ss", f"{start:.2f}", "-t", f"{length:.2f}", "-i", str(path),
+         "-vf", f"fps=1,scale={scan_width}:{scan_height}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+        capture_output=True,
+    ).stdout
+    frames = np.frombuffer(raw, np.uint8).reshape(-1, scan_height, scan_width, 3)
+    if not len(frames):
+        return Layout("blur", aspect)
+    hits: dict[tuple[int, int], list[tuple[float, float, float, float]]] = {}
+    detector = _face_detector()
+    for frame in frames:
+        _found, faces = detector.detect(np.ascontiguousarray(frame))
+        for face in faces if faces is not None else []:
+            x, y, w, h = (float(value) for value in face[:4])
+            box = (x / scan_width, y / scan_height, w / scan_width, h / scan_height)
+            cell = (int((box[0] + box[2] / 2) / 0.15), int((box[1] + box[3] / 2) / 0.15))
+            hits.setdefault(cell, []).append(box)
+    if not hits:
+        return Layout("blur", aspect)
+    def summary(boxes: list[tuple[float, float, float, float]]) -> tuple[tuple[float, ...], float]:
+        found = np.array(boxes)
+        centers = found[:, :2] + found[:, 2:] / 2
+        return tuple(float(v) for v in np.median(found, axis=0)), float(centers.std(axis=0).max())
+
+    boxes = max(hits.values(), key=lambda found: (len(found), float(np.mean([b[2] for b in found]))))
+    if len(boxes) >= max(2, 0.4 * len(frames)):
+        face, _spread = summary(boxes)
+        if 0.28 <= face[0] + face[2] / 2 <= 0.72:
+            return Layout("follow", aspect, face)
+    webcams = []
+    for boxes in hits.values():
+        face, spread = summary(boxes)
+        if (
+            0.6 * len(frames) <= len(boxes) <= 1.1 * len(frames)
+            and face[2] <= 0.14
+            and spread <= 0.04
+            and not 0.28 <= face[0] + face[2] / 2 <= 0.72
+        ):
+            webcams.append((len(boxes), -spread, face))
+    if webcams:
+        return Layout("split", aspect, max(webcams)[2])
+    return Layout("blur", aspect)
+
+
 def build_moment(candidate: Candidate, shortest: float, longest: float, language: str) -> Moment:
     path = fetch_media(candidate)
     audio = load_audio(path)
@@ -484,7 +583,7 @@ def build_moment(candidate: Candidate, shortest: float, longest: float, language
         for cue in words
         if start <= cue.start < start + span
     ]
-    return Moment(candidate, path, start, span, cues, peak)
+    return Moment(candidate, path, start, span, cues, peak, detect_layout(path, start, span))
 
 
 def collect_moments(
@@ -511,7 +610,8 @@ def collect_moments(
         print(
             f"  #{len(moments)} @{candidate.streamer} ({candidate.platform}, {candidate.views} vistas): "
             f"«{candidate.title}» -> {moment.start:.1f}-{moment.start + moment.length:.1f}s "
-            f"({moment.length:.1f}s, pico en {moment.peak:.1f}s, {len(moment.cues)} palabras)"
+            f"({moment.length:.1f}s, pico en {moment.peak:.1f}s, {len(moment.cues)} palabras, "
+            f"formato {moment.layout.kind if moment.layout else 'blur'})"
         )
     return moments
 
@@ -564,37 +664,107 @@ def write_short_captions(
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
         "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Title,Arial Black,84,{style},1,5,3,8,60,60,250,1",
-        f"Style: Credit,Arial Black,44,{style},1,4,2,8,60,60,{VIDEO_TOP - 80},1",
+        f"Style: Title,Arial Black,84,{style},1,5,3,8,60,60,110,1",
+        f"Style: Credit,Arial Black,48,{style},1,4,2,8,60,60,110,1",
         f"Style: Caption,Arial Black,76,{style},1,4,3,8,60,60,{height - VIDEO_TOP + 70},1",
+        f"Style: CaptionSplit,Arial Black,80,{style},1,5,3,8,60,60,{SPLIT_TOP - 55},1",
+        f"Style: CaptionFollow,Arial Black,80,{style},1,5,3,2,60,60,"
+        f"{(height - FOLLOW_BOX[1]) // 2 + 120},1",
         "Style: Brand,Arial Black,40,&H40FFFFFF,&H000000FF,&H40000000,&H00000000,"
         "-1,0,0,0,100,100,2,0,1,3,0,2,60,60,110,1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-        f"Dialogue: 2,{_ass_clock(0)},{_ass_clock(total)},Title,,0,0,0,,"
-        f"{{\\fad(150,0)\\fscx115\\fscy115\\t(0,250,\\fscx100\\fscy100)}}{_title_text(title)}",
+        f"Dialogue: 2,{_ass_clock(0)},{_ass_clock(min(INTRO_SECONDS, total))},Title,,0,0,0,,"
+        f"{{\\fad(150,250)\\fscx115\\fscy115\\t(0,250,\\fscx100\\fscy100)}}{_title_text(title)}",
     ]
+    caption_style = {"split": "CaptionSplit", "follow": "CaptionFollow"}
     offset = 0.0
     for moment in moments:
         candidate = moment.candidate
         start, end = _ass_clock(offset), _ass_clock(offset + moment.length)
         context = _clip_title(candidate.title)
-        if context:
+        context_start = offset + (INTRO_SECONDS if offset == 0 else 0.0)
+        context_end = min(offset + moment.length, context_start + INTRO_SECONDS)
+        if context and context_end > context_start:
             lines.append(
-                f"Dialogue: 1,{start},{end},Credit,,0,0,0,,{{\\fad(200,0)}}{YELLOW}«{context}»{WHITE}"
+                f"Dialogue: 1,{_ass_clock(context_start)},{_ass_clock(context_end)},Credit,,0,0,0,,"
+                f"{{\\fad(200,250)}}{YELLOW}«{context}»{WHITE}"
             )
         lines.append(f"Dialogue: 2,{start},{end},Brand,,0,0,0,,{_source_label(candidate, channel)}")
+        style_name = caption_style.get(moment.layout.kind if moment.layout else "", "Caption")
         shifted = [
             CaptionCue(cue.text, cue.start + offset, cue.end + offset) for cue in moment.cues
         ]
         for word_start, word_end, text in _caption_events(shifted) if shifted else []:
             lines.append(
-                f"Dialogue: 0,{_ass_clock(word_start)},{_ass_clock(word_end)},Caption,,0,0,0,,{_pop(text)}"
+                f"Dialogue: 0,{_ass_clock(word_start)},{_ass_clock(word_end)},{style_name},,0,0,0,,"
+                f"{_pop(text)}"
             )
         offset += moment.length
     destination.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
     return destination
+
+
+def _zoom(moment: Moment, width: int, height: int) -> str:
+    """Zoom lento continuo más un golpe de zoom en el pico del momento."""
+    amount = (
+        f"(1+{DRIFT_ZOOM}*t/{moment.length:.3f}"
+        f"+{PUNCH_ZOOM}*exp(-pow((t-{moment.peak:.2f})/0.45\\,2)))"
+    )
+    return (
+        f"scale=w='trunc(iw*{amount}/2)*2':h='trunc(ih*{amount}/2)*2':eval=frame,"
+        f"crop={width}:{height}"
+    )
+
+
+def _region(center_x: float, center_y: float, rel_w: float, rel_h: float) -> str:
+    """Recorte relativo (0-1) centrado en un punto, sin salirse del fotograma."""
+    rel_w, rel_h = min(rel_w, 1.0), min(rel_h, 1.0)
+    x = min(max(center_x - rel_w / 2, 0.0), 1.0 - rel_w)
+    y = min(max(center_y - rel_h / 2, 0.0), 1.0 - rel_h)
+    return f"crop=w='iw*{rel_w:.4f}':h='ih*{rel_h:.4f}':x='iw*{x:.4f}':y='ih*{y:.4f}'"
+
+
+def _layout_filters(index: int, moment: Moment, cut: str, entrance: str) -> list[str]:
+    width, height = FRAME_SIZE
+    layout = moment.layout or Layout("blur", 16 / 9)
+    finish = f"setsar=1,format=yuv420p,{entrance}[v{index}]"
+    blurred = (
+        f"[raw{index}]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},boxblur=24:2,eq=brightness=-0.18:saturation=1.2[bg{index}]"
+    )
+    if layout.kind == "split" and layout.face:
+        x, y, w, h = layout.face
+        cam_ratio = width / SPLIT_TOP
+        cam_w = min(max(w * 3.4, 0.16), 0.45)
+        cam = _region(x + w / 2, y + h * 0.65, cam_w, cam_w * layout.aspect / cam_ratio)
+        game_h = SOURCE_KEEP
+        game = _region(0.5, game_h / 2, game_h * (width / (height - SPLIT_TOP)) / layout.aspect, game_h)
+        return [
+            f"[{index}:v]{cut},fps={FPS},split[cam{index}][game{index}]",
+            f"[cam{index}]{cam},scale={width}:{SPLIT_TOP},setsar=1[c{index}]",
+            f"[game{index}]{game},scale={width}:{height - SPLIT_TOP},setsar=1[g{index}]",
+            f"[c{index}][g{index}]vstack,{_zoom(moment, width, height)},{finish}",
+        ]
+    if layout.kind == "follow" and layout.face:
+        x, _y, w, _h = layout.face
+        box_w, box_h = FOLLOW_BOX
+        region = _region(x + w / 2, SOURCE_KEEP / 2, SOURCE_KEEP * (box_w / box_h) / layout.aspect, SOURCE_KEEP)
+        return [
+            f"[{index}:v]{cut},fps={FPS},split[raw{index}][top{index}]",
+            blurred,
+            f"[top{index}]{region},scale={box_w}:{box_h},{_zoom(moment, box_w, box_h)}[fg{index}]",
+            f"[bg{index}][fg{index}]overlay=(W-w)/2:(H-h)/2,{finish}",
+        ]
+    box = height - 2 * VIDEO_TOP
+    return [
+        f"[{index}:v]{cut},fps={FPS},split[raw{index}][top{index}]",
+        blurred,
+        f"[top{index}]scale={width}:{box}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{box},{_zoom(moment, width, box)}[fg{index}]",
+        f"[bg{index}][fg{index}]overlay=(W-w)/2:(H-h)/2,{finish}",
+    ]
 
 
 def render_short(
@@ -606,26 +776,8 @@ def render_short(
     parts: list[str] = []
     for index, moment in enumerate(moments):
         cut = f"trim=start={moment.start:.3f}:duration={moment.length:.3f},setpts=PTS-STARTPTS"
-        parts.append(f"[{index}:v]{cut},fps={FPS},split[raw{index}][top{index}]")
-        parts.append(
-            f"[raw{index}]scale={width}:{height}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{height},boxblur=24:2,eq=brightness=-0.18:saturation=1.2[bg{index}]"
-        )
-        box = height - 2 * VIDEO_TOP
-        zoom = (
-            f"(1+{DRIFT_ZOOM}*t/{moment.length:.3f}"
-            f"+{PUNCH_ZOOM}*exp(-pow((t-{moment.peak:.2f})/0.45\\,2)))"
-        )
-        parts.append(
-            f"[top{index}]scale={width}:{box}:force_original_aspect_ratio=increase,"
-            f"crop={width}:{box},scale=w='trunc(iw*{zoom}/2)*2':h='trunc(ih*{zoom}/2)*2':"
-            f"eval=frame,crop={width}:{box}[fg{index}]"
-        )
         entrance = "fade=t=in:st=0:d=0.25" if index == 0 else "fade=t=in:st=0:d=0.12:color=white"
-        parts.append(
-            f"[bg{index}][fg{index}]overlay=(W-w)/2:(H-h)/2,setsar=1,format=yuv420p,"
-            f"{entrance}[v{index}]"
-        )
+        parts.extend(_layout_filters(index, moment, cut, entrance))
         parts.append(
             f"[{index}:a]atrim=start={moment.start:.3f}:duration={moment.length:.3f},"
             f"asetpts=PTS-STARTPTS,aresample=44100,loudnorm=I=-14:TP=-1.5:LRA=11,"

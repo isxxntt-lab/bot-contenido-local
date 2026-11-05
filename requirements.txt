@@ -19,3 +19,6 @@ yt-dlp>=2026.10
 # Clipazos ES: transcripción local con tiempos por palabra.
 faster-whisper>=1.2
 numpy>=2.0
+
+# Clipazos ES: detectar la webcam del streamer (modelo YuNet en assets/models).
+opencv-python-headless>=4.10
