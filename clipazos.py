@@ -666,7 +666,8 @@ def write_short_captions(
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
         f"Style: Title,Arial Black,84,{style},1,5,3,8,60,60,110,1",
         f"Style: Credit,Arial Black,48,{style},1,4,2,8,60,60,110,1",
-        f"Style: Caption,Arial Black,76,{style},1,4,3,8,60,60,{height - VIDEO_TOP + 70},1",
+        f"Style: Caption,Arial Black,76,{style},1,4,3,8,60,60,"
+        f"{(height + int(width * SOURCE_KEEP * 9 / 16)) // 2 + 50},1",
         f"Style: CaptionSplit,Arial Black,80,{style},1,5,3,8,60,60,{SPLIT_TOP - 55},1",
         f"Style: CaptionFollow,Arial Black,80,{style},1,5,3,2,60,60,"
         f"{(height - FOLLOW_BOX[1]) // 2 + 120},1",
@@ -757,11 +758,11 @@ def _layout_filters(index: int, moment: Moment, cut: str, entrance: str) -> list
             f"[top{index}]{region},scale={box_w}:{box_h},{_zoom(moment, box_w, box_h)}[fg{index}]",
             f"[bg{index}][fg{index}]overlay=(W-w)/2:(H-h)/2,{finish}",
         ]
-    box = height - 2 * VIDEO_TOP
+    box = min(height - 2 * VIDEO_TOP, int(width * SOURCE_KEEP / layout.aspect) // 2 * 2)
     return [
         f"[{index}:v]{cut},fps={FPS},split[raw{index}][top{index}]",
         blurred,
-        f"[top{index}]scale={width}:{box}:force_original_aspect_ratio=increase,"
+        f"[top{index}]crop=iw:ih*{SOURCE_KEEP}:0:0,scale={width}:{box}:force_original_aspect_ratio=increase,"
         f"crop={width}:{box},{_zoom(moment, width, box)}[fg{index}]",
         f"[bg{index}][fg{index}]overlay=(W-w)/2:(H-h)/2,{finish}",
     ]
