@@ -255,15 +255,20 @@ def scout_youtube(settings: dict) -> list[Candidate]:
     found: list[Candidate] = []
     for channel in settings.get("canales", []):
         try:
-            with _ytdlp({"extract_flat": True, "playlistend": 3}) as downloader:
+            with _ytdlp({"extract_flat": True, "playlistend": 4}) as downloader:
                 listing = downloader.extract_info(
                     f"https://www.youtube.com/{channel}/streams", download=False
                 )
             for entry in listing.get("entries") or []:
-                if entry.get("live_status") == "is_live":
+                if entry.get("live_status") in ("is_live", "is_upcoming"):
                     continue
-                with _ytdlp() as downloader:
-                    info = downloader.extract_info(entry["url"], download=False)
+                try:
+                    with _ytdlp() as downloader:
+                        info = downloader.extract_info(entry["url"], download=False)
+                except Exception:  # noqa: BLE001 - directo programado o retirado
+                    continue
+                if info.get("live_status") in ("is_live", "is_upcoming"):
+                    continue
                 stamp = info.get("release_timestamp") or info.get("timestamp")
                 created = datetime.fromtimestamp(stamp, timezone.utc) if stamp else None
                 if created is None or created < limit:
@@ -971,6 +976,13 @@ def main(argv: list[str] | None = None) -> int:
         if not picked:
             print("\nNo hay ningún streamer con clips suficientes hoy.", file=sys.stderr)
         for name, pool in picked:
+            short = streamer_short(pool, name, config, today)
+            if short:
+                report["shorts"].append(short)
+        kick_wanted = int(config.get("kick", {}).get("shorts_por_dia", 0))
+        used = {short["streamer"].casefold() for short in report["shorts"]}
+        for name, pool in top_streamers(kick, kick_wanted, excluded | recent | used):
+            print("\nDesde Kick:")
             short = streamer_short(pool, name, config, today)
             if short:
                 report["shorts"].append(short)

@@ -13,12 +13,13 @@
     "categorias_excluidas": ["Slots", "Virtual Casino", "Pools, Hot Tubs, and Beaches", "ASMR"]
   },
   "kick": {
-    "streamers": ["westcol"],
+    "streamers": ["westcol", "spreen", "davooxeneize", "lacobraaa", "elzeein", "robleis", "brunenger", "duendepablo"],
     "horas": 48,
-    "vistas_minimas": 50
+    "vistas_minimas": 20,
+    "shorts_por_dia": 1
   },
   "youtube": {
-    "canales": ["@TheGrefg"],
+    "canales": [],
     "horas": 48
   },
   "radar": {
