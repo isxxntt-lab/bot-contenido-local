@@ -42,5 +42,6 @@
     "activa": true,
     "privacidad": "private"
   },
+  "dias_guardar_videos": 14,
   "excluir_streamers": []
 }

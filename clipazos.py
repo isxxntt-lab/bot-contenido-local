@@ -353,13 +353,23 @@ def _safe_name(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", text)[:80]
 
 
-def clean_cache(days: int = CACHE_DAYS) -> None:
-    if not CACHE_DIR.is_dir():
-        return
+def clean_cache(days: int = CACHE_DAYS, keep_videos: int = 0) -> None:
+    """Borra clips de la caché viejos y, si keep_videos > 0, Shorts de hace más de esos días.
+
+    Los reportes .json se conservan: el radar y el «no repetir» los necesitan.
+    """
     limit = time.time() - days * 86400
-    for path in CACHE_DIR.glob("*.mp4"):
-        if path.stat().st_mtime < limit:
-            path.unlink(missing_ok=True)
+    if CACHE_DIR.is_dir():
+        for path in CACHE_DIR.glob("*.mp4"):
+            if path.stat().st_mtime < limit:
+                path.unlink(missing_ok=True)
+    if keep_videos <= 0 or not CLIPAZOS_DIR.is_dir():
+        return
+    limit = time.time() - keep_videos * 86400
+    for pattern in ("streamer_*.mp4", "streamer_*.ass", "streamer_*_filter.txt", "preview_*.png"):
+        for path in CLIPAZOS_DIR.glob(pattern):
+            if path.stat().st_mtime < limit:
+                path.unlink(missing_ok=True)
 
 
 def fetch_media(candidate: Candidate) -> Path:
@@ -963,7 +973,7 @@ def main(argv: list[str] | None = None) -> int:
             _upload(config, daily_report)
             return 0
     print(f"{channel}: buscando momentazos de las últimas 24 h...")
-    clean_cache()
+    clean_cache(keep_videos=int(config.get("dias_guardar_videos", 14)))
 
     twitch = scout_twitch(config.get("twitch", {}), language)
     kick = scout_kick(config.get("kick", {}))
