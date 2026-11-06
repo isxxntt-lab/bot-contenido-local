@@ -37,8 +37,9 @@ from video_editor import (
     OUTPUT_DIR,
     CaptionCue,
     _ass_clock,
-    _caption_events,
+    _ass_word,
     _ffmpeg_exe,
+    _phrase_text,
     _filter_path,
     _run_ffmpeg,
     _utf8_stdio,
@@ -655,10 +656,30 @@ def _source_label(candidate: Candidate, channel: str) -> str:
 
 
 def _pop(text: str) -> str:
-    """La palabra activa entra un 25 % más grande y vuelve a su tamaño en 0,12 s."""
-    active = YELLOW[:-1] + "\\fscx125\\fscy125\\t(0,120,\\fscx100\\fscy100)}"
+    """La palabra entra un 30 % más grande y vuelve a su tamaño en 0,1 s."""
+    active = YELLOW[:-1] + "\\fscx130\\fscy130\\t(0,100,\\fscx100\\fscy100)}"
     reset = WHITE[:-1] + "\\fscx100\\fscy100}"
     return text.replace(YELLOW, active).replace(WHITE, reset)
+
+
+def _live_caption_events(cues: list[CaptionCue]) -> list[tuple[float, float, str]]:
+    """Una palabra cada vez, solo mientras se está diciendo.
+
+    No se adelanta la siguiente ni se deja la frase quieta en los silencios.
+    """
+    events: list[tuple[float, float, str]] = []
+    for index, cue in enumerate(cues):
+        end = max(cue.end, cue.start + 0.16)
+        if index + 1 < len(cues):
+            end = min(end, cues[index + 1].start)
+        if end <= cue.start:
+            end = cue.start + 0.08
+        label = _ass_word(cue.text)
+        if not label:
+            continue
+        size = 124 if len(label) <= 7 else 100 if len(label) <= 11 else 78
+        events.append((cue.start, end, "{\\fs%d\\fad(20,40)}" % size + _phrase_text([cue.text], 0)))
+    return events
 
 
 def write_short_captions(
@@ -712,7 +733,7 @@ def write_short_captions(
         shifted = [
             CaptionCue(cue.text, cue.start + offset, cue.end + offset) for cue in moment.cues
         ]
-        for word_start, word_end, text in _caption_events(shifted) if shifted else []:
+        for word_start, word_end, text in _live_caption_events(shifted):
             lines.append(
                 f"Dialogue: 0,{_ass_clock(word_start)},{_ass_clock(word_end)},{style_name},,0,0,0,,"
                 f"{_pop(text)}"
