@@ -18,10 +18,15 @@ BASE_DIR = Path(__file__).resolve().parent
 CREDENTIALS_DIR = BASE_DIR / "credenciales"
 CLIENT_SECRET = CREDENTIALS_DIR / "client_secret.json"
 TOKEN_PATH = CREDENTIALS_DIR / "youtube_token.json"
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+SCOPES = ["https://www.googleapis.com/auth/youtube"]
 GAMING_CATEGORY = "20"
 TITLE_LIMIT = 100
 DESCRIPTION_LIMIT = 5000
+
+
+def _scopes_ok(credentials) -> bool:
+    granted = set(getattr(credentials, "scopes", None) or [])
+    return set(SCOPES).issubset(granted)
 
 
 def _credentials(interactive: bool):
@@ -30,7 +35,9 @@ def _credentials(interactive: bool):
 
     credentials = None
     if TOKEN_PATH.is_file():
-        credentials = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        credentials = Credentials.from_authorized_user_file(str(TOKEN_PATH))
+    if credentials and not _scopes_ok(credentials):
+        credentials = None
     if credentials and credentials.valid:
         return credentials
     if credentials and credentials.expired and credentials.refresh_token:
@@ -102,12 +109,20 @@ def upload_short(short: dict, privacy: str = "private") -> str:
     return response["id"]
 
 
+def delete_video(video_id: str) -> None:
+    """Borra un vídeo del canal. Hace falta el permiso de gestionar YouTube."""
+    from googleapiclient.discovery import build
+
+    service = build("youtube", "v3", credentials=_credentials(interactive=False), cache_discovery=False)
+    service.videos().delete(id=video_id).execute()
+
+
 def upload_report(report_path: Path, privacy: str = "private") -> int:
     """Sube los Shorts del reporte que aún no tengan youtube_id. Devuelve cuántos subió."""
     report = json.loads(report_path.read_text(encoding="utf-8"))
     uploaded = 0
     for short in report.get("shorts", []):
-        if short.get("youtube_id"):
+        if short.get("youtube_id") or short.get("no_subir"):
             continue
         try:
             video_id = upload_short(short, privacy)
