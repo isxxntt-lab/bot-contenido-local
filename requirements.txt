@@ -22,3 +22,7 @@ numpy>=2.0
 
 # Clipazos ES: detectar la webcam del streamer (modelo YuNet en assets/models).
 opencv-python-headless>=4.10
+
+# Clipazos ES: subida a YouTube Shorts con la API oficial gratuita.
+google-api-python-client>=2.150
+google-auth-oauthlib>=1.2

@@ -27,6 +27,9 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
+# Credenciales de YouTube (client_secret.json y token)
+credenciales/
+
 # Credenciales locales de n8n (no versionar)
 n8n/CREDENCIALES-LOCAL.txt
 

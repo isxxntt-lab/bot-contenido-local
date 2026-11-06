@@ -818,7 +818,8 @@ def post_text(moments: list[Moment], headline: str, extra_tags: list[str]) -> di
         f"#{rank} @{moment.candidate.streamer} ({moment.candidate.platform}): {moment.candidate.url}"
         for rank, moment in enumerate(moments, start=1)
     ]
-    tags = ["#clipazos", "#streamers", "#twitch", "#clipsespañol"] + extra_tags
+    platforms = list(dict.fromkeys(f"#{moment.candidate.platform.lower()}" for moment in moments))
+    tags = ["#clipazos", "#streamers", *platforms, "#clipsespañol"] + extra_tags
     tags += [_hashtag(name).lower() for name in names[:3]]
     title = headline if len(names) == 1 else f"{headline}: {', '.join(names[:3])}"
     return {
@@ -1003,6 +1004,15 @@ def main(argv: list[str] | None = None) -> int:
     for short in report["shorts"]:
         print(f"\n{short['titulo']}\n{short['descripcion']}\n{' '.join(short['hashtags'])}")
     print(f"\nReporte: {report_path}")
+    upload = config.get("subida_youtube", {})
+    if upload.get("activa") and report["shorts"]:
+        import youtube_upload
+
+        if youtube_upload.is_ready():
+            print("\nSubiendo a YouTube...")
+            youtube_upload.upload_report(report_path, upload.get("privacidad", "private"))
+        else:
+            print("\nSubida a YouTube activa pero sin autorizar: python youtube_upload.py --autorizar")
     if not args.solo_radar and not report["shorts"]:
         return 1
     return 0

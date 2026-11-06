@@ -38,5 +38,9 @@
     "silencio_max_segundos": 10,
     "vistas_minimas_vod": 300
   },
+  "subida_youtube": {
+    "activa": true,
+    "privacidad": "private"
+  },
   "excluir_streamers": []
 }
