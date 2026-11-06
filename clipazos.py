@@ -57,8 +57,6 @@ FRAME_STEP = 0.25
 PAUSE_SECONDS = 0.35
 DEAD_AIR = 0.32
 PEAK_BONUS = 4.0
-PUNCH_ZOOM = 0.10
-DRIFT_ZOOM = 0.04
 WHISPER_MODEL = "small"
 YOUTUBE_SECTION = 30.0
 
@@ -87,7 +85,7 @@ FOLLOW_BOX = (1080, 1440)
 SOURCE_KEEP = 0.86
 INTRO_SECONDS = 3.0
 SILENCE_CUT = 0.65
-SILENCE_KEEP = 0.18
+SILENCE_KEEP = 0.20
 YELLOW = "{\\c&H" + ACTIVE_ASS + "&}"
 WHITE = "{\\c&HFFFFFF&}"
 
@@ -115,7 +113,6 @@ class Moment:
     peak: float = 0.0
     layout: Layout | None = None
     cuts: list[tuple[float, float]] = field(default_factory=list)
-    punches: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -604,7 +601,7 @@ def _keep_ranges(span: float, cues: list[CaptionCue]) -> list[tuple[float, float
             if ranges:
                 left, right = ranges[-1]
                 ranges[-1] = (left, min(span, right + SILENCE_KEEP))
-            ranges.append((max(0.0, cue.start - 0.05), word_end))
+            ranges.append((max(0.0, cue.start - SILENCE_KEEP), word_end))
         elif not ranges:
             ranges.append((0.0, word_end))
         else:
@@ -631,37 +628,18 @@ def _place(moment: float, ranges: list[tuple[float, float]]) -> float:
     return done
 
 
-def _loud_words(audio: np.ndarray, origin: float, cues: list[CaptionCue]) -> list[float]:
-    """Los instantes en los que la voz pega más fuerte, para el golpe de zoom."""
-    ranked: list[tuple[float, float]] = []
-    for cue in cues:
-        first = int((origin + cue.start) * SAMPLE_RATE)
-        last = int((origin + cue.end) * SAMPLE_RATE)
-        piece = audio[max(0, first):max(first + 1, last)]
-        if piece.size < 80:
-            continue
-        ranked.append((float(np.sqrt(np.mean(piece ** 2))), (cue.start + cue.end) / 2))
-    ranked.sort(reverse=True)
-    return [instant for _level, instant in ranked[:6]]
-
-
 def _tighten(
-    start: float, span: float, cues: list[CaptionCue], peak: float, punches: list[float]
-) -> tuple[float, list[CaptionCue], float, list[tuple[float, float]], list[float]]:
+    start: float, span: float, cues: list[CaptionCue], peak: float
+) -> tuple[float, list[CaptionCue], float, list[tuple[float, float]]]:
+    """Corta el silencio como auto-editor: se queda la voz y 0,2 s de margen."""
     ranges = _keep_ranges(span, cues)
     edited = [
         CaptionCue(cue.text, _place(cue.start, ranges), max(_place(cue.end, ranges), _place(cue.start, ranges) + 0.08))
         for cue in cues
     ]
     length = sum(right - left for left, right in ranges)
-    placed = []
-    for instant in [_place(item, ranges) for item in punches] or [_place(peak, ranges)]:
-        if all(abs(instant - previous) > 0.7 for previous in placed):
-            placed.append(min(instant, max(0.0, length - 0.05)))
-        if len(placed) == 4:
-            break
     cuts = [(start + left, start + right) for left, right in ranges]
-    return length, edited, min(_place(peak, ranges), max(0.0, length - 0.05)), cuts, placed or [0.0]
+    return length, edited, min(_place(peak, ranges), max(0.0, length - 0.05)), cuts
 
 
 def build_moment(candidate: Candidate, shortest: float, longest: float, language: str) -> Moment:
@@ -676,10 +654,8 @@ def build_moment(candidate: Candidate, shortest: float, longest: float, language
         for cue in words
         if start <= cue.start < start + span
     ]
-    length, cues, peak, cuts, punches = _tighten(start, span, cues, peak, _loud_words(audio, start, cues))
-    return Moment(
-        candidate, path, start, length, cues, peak, detect_layout(path, start, span), cuts, punches
-    )
+    length, cues, peak, cuts = _tighten(start, span, cues, peak)
+    return Moment(candidate, path, start, length, cues, peak, detect_layout(path, start, span), cuts)
 
 
 def collect_moments(
@@ -823,19 +799,6 @@ def write_short_captions(
     return destination
 
 
-def _zoom(moment: Moment, width: int, height: int) -> str:
-    """Zoom lento, un acercamiento al entrar y un golpe en cada palabra fuerte."""
-    hits = "+".join(
-        f"{PUNCH_ZOOM}*exp(-pow((t-{instant:.2f})/0.30\\,2))"
-        for instant in (moment.punches or [moment.peak])
-    )
-    amount = f"(1+{DRIFT_ZOOM}*t/{max(moment.length, 0.1):.3f}+0.05*exp(-pow((t-0.12)/0.16\\,2))+{hits})"
-    return (
-        f"scale=w='trunc(iw*{amount}/2)*2':h='trunc(ih*{amount}/2)*2':eval=frame,"
-        f"crop={width}:{height}"
-    )
-
-
 def _region(center_x: float, center_y: float, rel_w: float, rel_h: float) -> str:
     """Recorte relativo (0-1) centrado en un punto, sin salirse del fotograma."""
     rel_w, rel_h = min(rel_w, 1.0), min(rel_h, 1.0)
@@ -864,7 +827,7 @@ def _layout_filters(index: int, moment: Moment, source: str, entrance: str) -> l
             f"{source}fps={FPS},split[cam{index}][game{index}]",
             f"[cam{index}]{cam},scale={width}:{SPLIT_TOP},setsar=1[c{index}]",
             f"[game{index}]{game},scale={width}:{height - SPLIT_TOP},setsar=1[g{index}]",
-            f"[c{index}][g{index}]vstack,{_zoom(moment, width, height)},{finish}",
+            f"[c{index}][g{index}]vstack,{finish}",
         ]
     if layout.kind == "follow" and layout.face:
         x, _y, w, _h = layout.face
@@ -873,7 +836,7 @@ def _layout_filters(index: int, moment: Moment, source: str, entrance: str) -> l
         return [
             f"{source}fps={FPS},split[raw{index}][top{index}]",
             blurred,
-            f"[top{index}]{region},scale={box_w}:{box_h},{_zoom(moment, box_w, box_h)}[fg{index}]",
+            f"[top{index}]{region},scale={box_w}:{box_h}[fg{index}]",
             f"[bg{index}][fg{index}]overlay=(W-w)/2:(H-h)/2,{finish}",
         ]
     box = min(height - 2 * VIDEO_TOP, int(width * SOURCE_KEEP / layout.aspect) // 2 * 2)
@@ -881,7 +844,7 @@ def _layout_filters(index: int, moment: Moment, source: str, entrance: str) -> l
         f"{source}fps={FPS},split[raw{index}][top{index}]",
         blurred,
         f"[top{index}]crop=iw:ih*{SOURCE_KEEP}:0:0,scale={width}:{box}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{box},{_zoom(moment, width, box)}[fg{index}]",
+        f"crop={width}:{box}[fg{index}]",
         f"[bg{index}][fg{index}]overlay=(W-w)/2:(H-h)/2,{finish}",
     ]
 
