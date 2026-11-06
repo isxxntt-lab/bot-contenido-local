@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -86,6 +86,8 @@ SPLIT_TOP = 840
 FOLLOW_BOX = (1080, 1440)
 SOURCE_KEEP = 0.86
 INTRO_SECONDS = 3.0
+SILENCE_CUT = 0.65
+SILENCE_KEEP = 0.18
 YELLOW = "{\\c&H" + ACTIVE_ASS + "&}"
 WHITE = "{\\c&HFFFFFF&}"
 
@@ -112,6 +114,8 @@ class Moment:
     cues: list[CaptionCue]
     peak: float = 0.0
     layout: Layout | None = None
+    cuts: list[tuple[float, float]] = field(default_factory=list)
+    punches: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -587,6 +591,79 @@ def detect_layout(path: Path, start: float, length: float) -> Layout:
     return Layout("blur", aspect)
 
 
+def _keep_ranges(span: float, cues: list[CaptionCue]) -> list[tuple[float, float]]:
+    """Quita los silencios largos y deja un respiro corto, como un jump cut."""
+    if not cues:
+        return [(0.0, span)]
+    ranges: list[tuple[float, float]] = []
+    cursor = 0.0
+    for cue in cues:
+        gap = cue.start - cursor
+        word_end = min(span, cue.end)
+        if gap > SILENCE_CUT:
+            if ranges:
+                left, right = ranges[-1]
+                ranges[-1] = (left, min(span, right + SILENCE_KEEP))
+            ranges.append((max(0.0, cue.start - 0.05), word_end))
+        elif not ranges:
+            ranges.append((0.0, word_end))
+        else:
+            left, _right = ranges[-1]
+            ranges[-1] = (left, word_end)
+        cursor = word_end
+    if ranges and span - cursor > SILENCE_CUT:
+        left, right = ranges[-1]
+        ranges[-1] = (left, min(span, right + SILENCE_KEEP))
+    elif ranges:
+        left, _right = ranges[-1]
+        ranges[-1] = (left, span)
+    return [(left, right) for left, right in ranges if right - left > 0.05]
+
+
+def _place(moment: float, ranges: list[tuple[float, float]]) -> float:
+    done = 0.0
+    for left, right in ranges:
+        if moment <= left:
+            return done
+        if moment <= right:
+            return done + moment - left
+        done += right - left
+    return done
+
+
+def _loud_words(audio: np.ndarray, origin: float, cues: list[CaptionCue]) -> list[float]:
+    """Los instantes en los que la voz pega más fuerte, para el golpe de zoom."""
+    ranked: list[tuple[float, float]] = []
+    for cue in cues:
+        first = int((origin + cue.start) * SAMPLE_RATE)
+        last = int((origin + cue.end) * SAMPLE_RATE)
+        piece = audio[max(0, first):max(first + 1, last)]
+        if piece.size < 80:
+            continue
+        ranked.append((float(np.sqrt(np.mean(piece ** 2))), (cue.start + cue.end) / 2))
+    ranked.sort(reverse=True)
+    return [instant for _level, instant in ranked[:6]]
+
+
+def _tighten(
+    start: float, span: float, cues: list[CaptionCue], peak: float, punches: list[float]
+) -> tuple[float, list[CaptionCue], float, list[tuple[float, float]], list[float]]:
+    ranges = _keep_ranges(span, cues)
+    edited = [
+        CaptionCue(cue.text, _place(cue.start, ranges), max(_place(cue.end, ranges), _place(cue.start, ranges) + 0.08))
+        for cue in cues
+    ]
+    length = sum(right - left for left, right in ranges)
+    placed = []
+    for instant in [_place(item, ranges) for item in punches] or [_place(peak, ranges)]:
+        if all(abs(instant - previous) > 0.7 for previous in placed):
+            placed.append(min(instant, max(0.0, length - 0.05)))
+        if len(placed) == 4:
+            break
+    cuts = [(start + left, start + right) for left, right in ranges]
+    return length, edited, min(_place(peak, ranges), max(0.0, length - 0.05)), cuts, placed or [0.0]
+
+
 def build_moment(candidate: Candidate, shortest: float, longest: float, language: str) -> Moment:
     path = fetch_media(candidate)
     audio = load_audio(path)
@@ -599,7 +676,10 @@ def build_moment(candidate: Candidate, shortest: float, longest: float, language
         for cue in words
         if start <= cue.start < start + span
     ]
-    return Moment(candidate, path, start, span, cues, peak, detect_layout(path, start, span))
+    length, cues, peak, cuts, punches = _tighten(start, span, cues, peak, _loud_words(audio, start, cues))
+    return Moment(
+        candidate, path, start, length, cues, peak, detect_layout(path, start, span), cuts, punches
+    )
 
 
 def collect_moments(
@@ -625,8 +705,8 @@ def collect_moments(
         total += moment.length
         print(
             f"  #{len(moments)} @{candidate.streamer} ({candidate.platform}, {candidate.views} vistas): "
-            f"«{candidate.title}» -> {moment.start:.1f}-{moment.start + moment.length:.1f}s "
-            f"({moment.length:.1f}s, pico en {moment.peak:.1f}s, {len(moment.cues)} palabras, "
+            f"«{candidate.title}» -> desde {moment.start:.1f}s, queda en {moment.length:.1f}s "
+            f"({moment.length:.1f}s, {len(moment.cuts)} cortes, pico en {moment.peak:.1f}s, {len(moment.cues)} palabras, "
             f"formato {moment.layout.kind if moment.layout else 'blur'})"
         )
     return moments
@@ -744,11 +824,12 @@ def write_short_captions(
 
 
 def _zoom(moment: Moment, width: int, height: int) -> str:
-    """Zoom lento continuo más un golpe de zoom en el pico del momento."""
-    amount = (
-        f"(1+{DRIFT_ZOOM}*t/{moment.length:.3f}"
-        f"+{PUNCH_ZOOM}*exp(-pow((t-{moment.peak:.2f})/0.45\\,2)))"
+    """Zoom lento, un acercamiento al entrar y un golpe en cada palabra fuerte."""
+    hits = "+".join(
+        f"{PUNCH_ZOOM}*exp(-pow((t-{instant:.2f})/0.30\\,2))"
+        for instant in (moment.punches or [moment.peak])
     )
+    amount = f"(1+{DRIFT_ZOOM}*t/{max(moment.length, 0.1):.3f}+0.05*exp(-pow((t-0.12)/0.16\\,2))+{hits})"
     return (
         f"scale=w='trunc(iw*{amount}/2)*2':h='trunc(ih*{amount}/2)*2':eval=frame,"
         f"crop={width}:{height}"
@@ -763,10 +844,11 @@ def _region(center_x: float, center_y: float, rel_w: float, rel_h: float) -> str
     return f"crop=w='iw*{rel_w:.4f}':h='ih*{rel_h:.4f}':x='iw*{x:.4f}':y='ih*{y:.4f}'"
 
 
-def _layout_filters(index: int, moment: Moment, cut: str, entrance: str) -> list[str]:
+def _layout_filters(index: int, moment: Moment, source: str, entrance: str) -> list[str]:
     width, height = FRAME_SIZE
     layout = moment.layout or Layout("blur", 16 / 9)
-    finish = f"setsar=1,format=yuv420p,{entrance}[v{index}]"
+    grade = "eq=contrast=1.08:saturation=1.16:gamma=0.96,unsharp=5:5:0.5:5:5:0.0"
+    finish = f"setsar=1,{grade},format=yuv420p,{entrance}[v{index}]"
     blurred = (
         f"[raw{index}]scale={width}:{height}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height},boxblur=24:2,eq=brightness=-0.18:saturation=1.2[bg{index}]"
@@ -779,7 +861,7 @@ def _layout_filters(index: int, moment: Moment, cut: str, entrance: str) -> list
         game_h = SOURCE_KEEP
         game = _region(0.5, game_h / 2, game_h * (width / (height - SPLIT_TOP)) / layout.aspect, game_h)
         return [
-            f"[{index}:v]{cut},fps={FPS},split[cam{index}][game{index}]",
+            f"{source}fps={FPS},split[cam{index}][game{index}]",
             f"[cam{index}]{cam},scale={width}:{SPLIT_TOP},setsar=1[c{index}]",
             f"[game{index}]{game},scale={width}:{height - SPLIT_TOP},setsar=1[g{index}]",
             f"[c{index}][g{index}]vstack,{_zoom(moment, width, height)},{finish}",
@@ -789,19 +871,43 @@ def _layout_filters(index: int, moment: Moment, cut: str, entrance: str) -> list
         box_w, box_h = FOLLOW_BOX
         region = _region(x + w / 2, SOURCE_KEEP / 2, SOURCE_KEEP * (box_w / box_h) / layout.aspect, SOURCE_KEEP)
         return [
-            f"[{index}:v]{cut},fps={FPS},split[raw{index}][top{index}]",
+            f"{source}fps={FPS},split[raw{index}][top{index}]",
             blurred,
             f"[top{index}]{region},scale={box_w}:{box_h},{_zoom(moment, box_w, box_h)}[fg{index}]",
             f"[bg{index}][fg{index}]overlay=(W-w)/2:(H-h)/2,{finish}",
         ]
     box = min(height - 2 * VIDEO_TOP, int(width * SOURCE_KEEP / layout.aspect) // 2 * 2)
     return [
-        f"[{index}:v]{cut},fps={FPS},split[raw{index}][top{index}]",
+        f"{source}fps={FPS},split[raw{index}][top{index}]",
         blurred,
         f"[top{index}]crop=iw:ih*{SOURCE_KEEP}:0:0,scale={width}:{box}:force_original_aspect_ratio=increase,"
         f"crop={width}:{box},{_zoom(moment, width, box)}[fg{index}]",
         f"[bg{index}][fg{index}]overlay=(W-w)/2:(H-h)/2,{finish}",
     ]
+
+
+def _assemble_cuts(index: int, moment: Moment) -> tuple[str, list[str]]:
+    """Junta los trozos ya sin silencios y deja la voz más presente."""
+    ranges = moment.cuts or [(moment.start, moment.start + moment.length)]
+    lines: list[str] = []
+    video_labels: list[str] = []
+    audio_labels: list[str] = []
+    for piece, (left, right) in enumerate(ranges):
+        lines.append(
+            f"[{index}:v]trim=start={left:.3f}:end={right:.3f},setpts=PTS-STARTPTS[v{index}_{piece}]"
+        )
+        lines.append(
+            f"[{index}:a]atrim=start={left:.3f}:end={right:.3f},asetpts=PTS-STARTPTS[a{index}_{piece}]"
+        )
+        video_labels.append(f"[v{index}_{piece}]")
+        audio_labels.append(f"[a{index}_{piece}]")
+    lines.append(f"{''.join(video_labels)}concat=n={len(ranges)}:v=1:a=0[vcut{index}]")
+    lines.append(
+        f"{''.join(audio_labels)}concat=n={len(ranges)}:v=0:a=1,highpass=f=80,"
+        f"acompressor=threshold=-18dB:ratio=3:attack=8:release=90:makeup=2,"
+        f"loudnorm=I=-14:TP=-1.5:LRA=11,aresample=44100[a{index}]"
+    )
+    return f"[vcut{index}]", lines
 
 
 def render_short(
@@ -812,14 +918,10 @@ def render_short(
     captions = write_short_captions(moments, title, channel, work.with_name(work.name + ".ass"))
     parts: list[str] = []
     for index, moment in enumerate(moments):
-        cut = f"trim=start={moment.start:.3f}:duration={moment.length:.3f},setpts=PTS-STARTPTS"
+        source, cut_filters = _assemble_cuts(index, moment)
         entrance = "fade=t=in:st=0:d=0.25" if index == 0 else "fade=t=in:st=0:d=0.12:color=white"
-        parts.extend(_layout_filters(index, moment, cut, entrance))
-        parts.append(
-            f"[{index}:a]atrim=start={moment.start:.3f}:duration={moment.length:.3f},"
-            f"asetpts=PTS-STARTPTS,aresample=44100,loudnorm=I=-14:TP=-1.5:LRA=11,"
-            f"aresample=44100[a{index}]"
-        )
+        parts.extend(cut_filters)
+        parts.extend(_layout_filters(index, moment, source, entrance))
     joined = "".join(f"[v{index}][a{index}]" for index in range(len(moments)))
     parts.append(f"{joined}concat=n={len(moments)}:v=1:a=1[vcat][aout]")
     fonts = _filter_path(Path(r"C:\Windows\Fonts"))
