@@ -80,7 +80,7 @@ NON_GAMES = {
 
 VIDEO_TOP = (FRAME_SIZE[1] - FRAME_SIZE[0] * 9 // 16) // 2
 FACE_MODEL = BASE_DIR / "assets" / "models" / "face_detection_yunet_2023mar.onnx"
-SCAN_SIZE = (640, 360)
+SCAN_SIZE = (1280, 720)
 SPLIT_TOP = 840
 FOLLOW_BOX = (1080, 1440)
 SOURCE_KEEP = 0.86
@@ -857,6 +857,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--streamer", help="Short con los mejores clips de un solo streamer.")
     parser.add_argument("--clips", type=int, help="Máximo de clips por vídeo (clips_maximos).")
     parser.add_argument("--segundos", type=float, help="Duración objetivo del Short (segundos_objetivo).")
+    parser.add_argument("--forzar", action="store_true", help="Rehace los Shorts aunque ya estén hechos hoy.")
     return parser.parse_args(argv)
 
 
@@ -925,6 +926,20 @@ def streamer_short(
     return short
 
 
+def _upload(config: dict, report_path: Path) -> None:
+    """Sube a YouTube los Shorts del reporte que aún no estén subidos."""
+    upload = config.get("subida_youtube", {})
+    if not upload.get("activa"):
+        return
+    import youtube_upload
+
+    if youtube_upload.is_ready():
+        print("\nSubiendo a YouTube...")
+        youtube_upload.upload_report(report_path, upload.get("privacidad", "private"))
+    else:
+        print("\nSubida a YouTube activa pero sin autorizar: ejecuta autorizar_youtube.bat")
+
+
 def main(argv: list[str] | None = None) -> int:
     _utf8_stdio()
     args = parse_args(argv)
@@ -937,6 +952,16 @@ def main(argv: list[str] | None = None) -> int:
     language = config.get("idioma", "es")
     today = datetime.now().strftime("%Y%m%d")
     excluded = {name.casefold() for name in config.get("excluir_streamers", [])}
+    daily_report = CLIPAZOS_DIR / f"reporte_{today}.json"
+    if not (args.streamer or args.solo_radar or args.forzar) and daily_report.is_file():
+        try:
+            done = json.loads(daily_report.read_text(encoding="utf-8")).get("shorts", [])
+        except (OSError, ValueError):
+            done = []
+        if done:
+            print(f"{channel}: los Shorts de hoy ya están hechos ({len(done)}). Usa --forzar para rehacerlos.")
+            _upload(config, daily_report)
+            return 0
     print(f"{channel}: buscando momentazos de las últimas 24 h...")
     clean_cache()
 
@@ -1004,15 +1029,8 @@ def main(argv: list[str] | None = None) -> int:
     for short in report["shorts"]:
         print(f"\n{short['titulo']}\n{short['descripcion']}\n{' '.join(short['hashtags'])}")
     print(f"\nReporte: {report_path}")
-    upload = config.get("subida_youtube", {})
-    if upload.get("activa") and report["shorts"]:
-        import youtube_upload
-
-        if youtube_upload.is_ready():
-            print("\nSubiendo a YouTube...")
-            youtube_upload.upload_report(report_path, upload.get("privacidad", "private"))
-        else:
-            print("\nSubida a YouTube activa pero sin autorizar: python youtube_upload.py --autorizar")
+    if report["shorts"]:
+        _upload(config, report_path)
     if not args.solo_radar and not report["shorts"]:
         return 1
     return 0

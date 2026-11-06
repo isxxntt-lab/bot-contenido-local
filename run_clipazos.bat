@@ -15,16 +15,18 @@ set PYTHONIOENCODING=utf-8
 call ".venv\Scripts\activate.bat"
 if not exist "output\clipazos" mkdir "output\clipazos"
 
-rem Cada ejecución queda guardada en output\clipazos\ultimo_run.log.
-echo ===== %date% %time% ===== > "output\clipazos\ultimo_run.log"
-python clipazos.py %* >> "output\clipazos\ultimo_run.log" 2>&1
-if errorlevel 1 (
-    type "output\clipazos\ultimo_run.log"
+rem La última ejecución queda en ultimo_run.log y todas se acumulan en historial.log.
+set "LOG=output\clipazos\ultimo_run.log"
+echo ===== %date% %time% ===== > "%LOG%"
+python clipazos.py %* >> "%LOG%" 2>&1
+set "RESULTADO=%errorlevel%"
+type "%LOG%" >> "output\clipazos\historial.log"
+type "%LOG%"
+if not "%RESULTADO%"=="0" (
     echo.
-    echo Clipazos ES terminó con errores. Revisa output\clipazos\ultimo_run.log
+    echo Clipazos ES terminó con errores. Revisa output\clipazos\historial.log
     exit /b 1
 )
-type "output\clipazos\ultimo_run.log"
 
 echo.
 echo Clipazos ES listo. Los vídeos están en output\clipazos.
