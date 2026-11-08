@@ -40,7 +40,7 @@
   },
   "subida_youtube": {
     "activa": true,
-    "privacidad": "private"
+    "privacidad": "public"
   },
   "dias_guardar_videos": 14,
   "excluir_streamers": []

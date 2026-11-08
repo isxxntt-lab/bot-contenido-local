@@ -6,8 +6,9 @@ Flujo 100 % local y sin claves:
   2. Radar: guarda las vistas por juego y por streamer de cada día para detectar
      qué juego se dispara (Short especial de hype) y quién está subiendo.
   3. yt-dlp localiza cada clip y FFmpeg recorta solo el tramo necesario.
-  4. faster-whisper transcribe en local con tiempos por palabra; el tramo elegido
-     mezcla energía de audio (gritos, risas) y que se esté hablando.
+  4. El clip entra al Short por vistas por hora y, en Twitch, por lo denso que
+     está el chat del VOD en ese segundo. Dentro del clip, el corte persigue el
+     salto de sonido y las palabras de reacción, no el tramo que solo está alto.
   5. FFmpeg monta el vertical: fondo desenfocado, clip centrado, título, crédito
      del streamer y subtítulos con la palabra activa en amarillo.
 
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import sys
@@ -55,8 +57,14 @@ CACHE_DAYS = 3
 SAMPLE_RATE = 16_000
 FRAME_STEP = 0.25
 PAUSE_SECONDS = 0.35
-DEAD_AIR = 0.32
-PEAK_BONUS = 4.0
+DEAD_AIR = 0.20
+PEAK_BONUS = 2.5
+# Palabras que marcan un pico. "no" o "que" sueltos no entran: salen en cualquier frase.
+SHOUTS = {
+    "hostia", "ostia", "dios", "diosmio", "joder", "mierda", "puta", "puto",
+    "vamos", "wtf", "omg", "bro", "tio", "tío", "nano", "calla", "callate",
+    "cállate", "para", "buah", "buag", "broo",
+}
 WHISPER_MODEL = "small"
 YOUTUBE_SECTION = 30.0
 
@@ -101,6 +109,10 @@ class Candidate:
     game: str | None = None
     created: datetime | None = None
     section: tuple[float, float] | None = None
+    seconds: float | None = None
+    vod_id: str | None = None
+    offset: float | None = None
+    chat_rate: float | None = None
 
 
 @dataclass
@@ -143,6 +155,147 @@ def _gql(query: str) -> dict:
     if data.get("errors"):
         raise RuntimeError(data["errors"][0].get("message", "error de Twitch"))
     return data.get("data") or {}
+
+
+def _gql_many(queries: list[str]) -> list[dict]:
+    """Varias consultas públicas en una sola petición."""
+    if not queries:
+        return []
+    request = urllib.request.Request(
+        TWITCH_GQL,
+        data=json.dumps([{"query": query} for query in queries]).encode(),
+        headers={"Client-ID": TWITCH_WEB_CLIENT_ID, "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=25) as response:
+        payload = json.load(response)
+    if isinstance(payload, dict):
+        payload = [payload]
+    return payload
+
+
+def _clip_slug(candidate: Candidate) -> str | None:
+    if candidate.platform != "Twitch":
+        return None
+    slug = candidate.url.rstrip("/").rsplit("/", 1)[-1]
+    return slug or None
+
+
+def _chat_burst(edges: list[dict]) -> float | None:
+    """Mensajes por segundo en la página de chat, con un extra si van llenos de emotes."""
+    points: list[tuple[float, int]] = []
+    for edge in edges:
+        node = edge.get("node") or {}
+        moment = node.get("contentOffsetSeconds")
+        if moment is None:
+            continue
+        fragments = ((node.get("message") or {}).get("fragments")) or []
+        emotes = sum(1 for fragment in fragments if fragment.get("emote"))
+        points.append((float(moment), emotes))
+    if len(points) < 5:
+        return None
+    points.sort()
+    span = max(1.0, points[-1][0] - points[0][0])
+    emote_ratio = sum(emotes for _moment, emotes in points) / len(points)
+    return (len(points) / span) * (1 + 0.3 * min(emote_ratio, 3.0))
+
+
+def attach_chat(candidates: list[Candidate]) -> None:
+    """Mide el pico de chat del VOD en los clips de Twitch que aún lo tengan.
+
+    El VOD a veces ya no existe: ese clip se queda solo con las vistas por hora.
+    """
+    pending = [candidate for candidate in candidates if _clip_slug(candidate) and candidate.chat_rate is None]
+    pending.sort(key=clip_weight, reverse=True)
+    pending = pending[:16]
+    if not pending:
+        return
+    lookups = [
+        "query{clip(slug:%s){videoOffsetSeconds durationSeconds video{id}}}" % json.dumps(_clip_slug(candidate))
+        for candidate in pending
+    ]
+    try:
+        found = _gql_many(lookups)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"  Aviso: no se pudo leer el momento del clip en Twitch ({exc})", file=sys.stderr)
+        return
+    comment_queries: list[str] = []
+    comment_targets: list[Candidate] = []
+    for candidate, item in zip(pending, found):
+        clip = ((item or {}).get("data") or {}).get("clip") or {}
+        video = clip.get("video") or {}
+        if clip.get("videoOffsetSeconds") is None or not video.get("id"):
+            continue
+        candidate.offset = float(clip["videoOffsetSeconds"])
+        candidate.vod_id = str(video["id"])
+        if clip.get("durationSeconds"):
+            candidate.seconds = float(clip["durationSeconds"])
+        spots = [int(candidate.offset)]
+        if candidate.seconds and candidate.seconds > 12:
+            spots.append(int(candidate.offset + candidate.seconds / 2))
+        for spot in spots:
+            comment_queries.append(
+                "query{video(id:%s){comments(contentOffsetSeconds:%d, first:50)"
+                "{edges{node{contentOffsetSeconds message{fragments{text emote{emoteID}}}}}}}}"
+                % (json.dumps(candidate.vod_id), spot)
+            )
+            comment_targets.append(candidate)
+    if not comment_queries:
+        return
+    try:
+        pages = _gql_many(comment_queries)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"  Aviso: el chat del VOD no respondió ({exc})", file=sys.stderr)
+        return
+    bursts: dict[int, float] = {}
+    for candidate, item in zip(comment_targets, pages):
+        edges = ((((item or {}).get("data") or {}).get("video") or {}).get("comments") or {}).get("edges") or []
+        burst = _chat_burst(edges)
+        if burst is None:
+            continue
+        bursts[id(candidate)] = max(bursts.get(id(candidate), 0.0), burst)
+    for candidate in pending:
+        if id(candidate) in bursts:
+            candidate.chat_rate = bursts[id(candidate)]
+
+
+def clip_weight(candidate: Candidate, now: datetime | None = None) -> float:
+    """Vistas por hora. El chat denso multiplica: 5 mensajes/s ya duplica el peso."""
+    now = now or datetime.now(timezone.utc)
+    if candidate.created is not None:
+        hours = max(0.5, (now - candidate.created).total_seconds() / 3600)
+    else:
+        hours = 12.0
+    velocity = math.log1p(candidate.views / hours)
+    return velocity * (1.0 + min(2.0, (candidate.chat_rate or 0.0) / 5.0))
+
+
+def rank_clips(pool: list[Candidate]) -> list[Candidate]:
+    """Primero el momento del directo: chat en pico, vistas rápidas y clips del mismo segundo."""
+    attach_chat(pool)
+    weights = {id(candidate): clip_weight(candidate) for candidate in pool}
+    grouped: dict[str, list[Candidate]] = {}
+    for candidate in pool:
+        if candidate.vod_id and candidate.offset is not None:
+            grouped.setdefault(candidate.vod_id, []).append(candidate)
+    for group in grouped.values():
+        ordered = sorted(group, key=lambda candidate: candidate.offset or 0.0)
+        cluster = [ordered[0]]
+        clusters = []
+        for candidate in ordered[1:]:
+            if (candidate.offset or 0.0) - (cluster[-1].offset or 0.0) <= 180:
+                cluster.append(candidate)
+            else:
+                clusters.append(cluster)
+                cluster = [candidate]
+        clusters.append(cluster)
+        for cluster in clusters:
+            if len(cluster) < 2:
+                continue
+            for candidate in cluster:
+                weights[id(candidate)] *= 1.2
+            hottest = max(cluster, key=lambda candidate: weights[id(candidate)])
+            weights[id(hottest)] *= 1.25
+    return sorted(pool, key=lambda candidate: weights[id(candidate)], reverse=True)
 
 
 def _parse_time(value: str | None) -> datetime | None:
@@ -196,6 +349,7 @@ def scout_twitch(settings: dict, language: str) -> list[Candidate]:
                 key=key,
                 game=(node.get("game") or {}).get("name") or category,
                 created=_parse_time(node.get("createdAt")),
+                seconds=float(node["durationSeconds"]),
             )
     return sorted(found.values(), key=lambda candidate: candidate.views, reverse=True)
 
@@ -441,19 +595,45 @@ def transcribe(audio: np.ndarray, language: str) -> list[CaptionCue]:
     )
 
 
-def _frame_scores(audio: np.ndarray, cues: list[CaptionCue]) -> tuple[np.ndarray, np.ndarray]:
-    """Energía suavizada (0-1) y habla (0/1) por fotograma de FRAME_STEP segundos."""
+def _reaction(word: str) -> float:
+    """Cuánto parece un grito o una risa. Una frase normal se queda en cero."""
+    plain = re.sub(r"[^\wáéíóúñü]", "", word, flags=re.IGNORECASE).casefold()
+    if not plain:
+        return 0.0
+    score = 0.0
+    if re.search(r"(.)\1{2,}", plain) or re.search(r"(?:ja|je|ji){2,}|lol+|xd+", plain):
+        score += 1.0
+    if plain in SHOUTS or word.endswith(("!", "?")):
+        score += 0.8
+    return min(score, 1.8)
+
+
+def _frame_scores(audio: np.ndarray, cues: list[CaptionCue]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Energía, salto de sonido y reacción, por fotograma de FRAME_STEP segundos.
+
+    El salto es lo que cambia de golpe (un grito), no el volumen medio del juego.
+    """
     step = int(SAMPLE_RATE * FRAME_STEP)
     frames = max(1, len(audio) // step)
-    energy = np.sqrt(np.mean(audio[: frames * step].reshape(frames, step) ** 2, axis=1))
+    chunk = audio[: frames * step].reshape(frames, step)
+    energy = np.sqrt(np.mean(chunk ** 2, axis=1))
     energy = np.convolve(energy, np.ones(3) / 3, mode="same")
-    energy = energy / max(float(energy.max()), 1e-6)
-    speech = np.zeros(frames)
+    baseline = np.convolve(energy, np.ones(9) / 9, mode="same")
+    jump = np.maximum(0.0, energy - baseline)
+    spectrum = np.log1p(np.abs(np.fft.rfft(chunk * np.hanning(step), axis=1)))
+    flux = np.zeros(frames, dtype=np.float64)
+    if frames > 1:
+        flux[1:] = np.maximum(np.diff(spectrum, axis=0), 0.0).sum(axis=1)
+    flux = np.convolve(flux, np.ones(3) / 3, mode="same")
+    spike = 0.7 * flux / max(float(flux.max()), 1e-6) + 0.3 * jump / max(float(jump.max()), 1e-6)
+    heat = np.zeros(frames)
     for cue in cues:
-        first = int(cue.start / FRAME_STEP)
+        weight = 0.35 + _reaction(cue.text)
+        first = max(0, int(cue.start / FRAME_STEP))
         last = min(frames - 1, int(cue.end / FRAME_STEP))
-        speech[first : last + 1] = 1.0
-    return energy, speech
+        if last >= first:
+            heat[first : last + 1] = np.maximum(heat[first : last + 1], weight)
+    return energy, spike, heat
 
 
 def _cut_points(cues: list[CaptionCue], total: float) -> tuple[list[float], list[float]]:
@@ -477,14 +657,14 @@ def choose_window(
 ) -> tuple[float, float, float]:
     """El momento completo: empieza en una frase, contiene el pico y acaba tras la reacción.
 
-    Devuelve (inicio, duración, pico relativo al inicio). La duración varía con el
-    momento, como en un clip editado a mano.
+    Devuelve (inicio, duración, pico relativo al inicio). Gana la ventana donde
+    el salto de sonido y la reacción están concentrados, no la más larga.
     """
     total = len(audio) / SAMPLE_RATE
-    energy, speech = _frame_scores(audio, cues)
-    value = 0.6 * energy + 0.4 * speech - DEAD_AIR
+    _energy, spike, heat = _frame_scores(audio, cues)
+    value = 0.7 * spike + 0.3 * heat - DEAD_AIR * (spike < 0.2)
     prefix = np.concatenate([[0.0], np.cumsum(value)])
-    peak_frame = int(np.argmax(energy * (0.5 + 0.5 * speech)))
+    peak_frame = int(np.argmax(spike * (0.35 + heat)))
     peak = peak_frame * FRAME_STEP
     starts, ends = _cut_points(cues, total)
     best: tuple[float, float, float] | None = None
@@ -494,18 +674,19 @@ def choose_window(
             if not shortest <= span <= longest:
                 continue
             first, last = int(start / FRAME_STEP), int(end / FRAME_STEP)
-            score = prefix[last] - prefix[first]
-            if start <= peak - 1.0 and end >= peak + 1.5:
+            score = (prefix[last] - prefix[first]) / max(1, last - first)
+            if start <= peak <= end:
                 score += PEAK_BONUS
             if best is None or score > best[0]:
                 best = (score, start, span)
     if best is None:
         span = min(total, max(shortest, min(longest, 12.0)))
-        start = min(max(0.0, peak - span * 0.45), total - span)
+        start = min(max(0.0, peak - span * 0.45), max(0.0, total - span))
     else:
         _score, start, span = best
-    first, last = int(start / FRAME_STEP), max(int(start / FRAME_STEP) + 1, int((start + span) / FRAME_STEP))
-    local_peak = (first + int(np.argmax(energy[first:last]))) * FRAME_STEP - start
+    first = int(start / FRAME_STEP)
+    last = max(first + 1, int((start + span) / FRAME_STEP))
+    local_peak = (first + int(np.argmax(spike[first:last]))) * FRAME_STEP - start
     return start, span, max(0.0, local_peak)
 
 
@@ -679,8 +860,9 @@ def collect_moments(
             continue
         moments.append(moment)
         total += moment.length
+        chat = f", chat {candidate.chat_rate:.0f}/s" if candidate.chat_rate else ""
         print(
-            f"  #{len(moments)} @{candidate.streamer} ({candidate.platform}, {candidate.views} vistas): "
+            f"  #{len(moments)} @{candidate.streamer} ({candidate.platform}, {candidate.views} vistas{chat}): "
             f"«{candidate.title}» -> desde {moment.start:.1f}s, queda en {moment.length:.1f}s "
             f"({moment.length:.1f}s, {len(moment.cuts)} cortes, pico en {moment.peak:.1f}s, {len(moment.cues)} palabras, "
             f"formato {moment.layout.kind if moment.layout else 'blur'})"
@@ -1002,9 +1184,10 @@ def recently_posted(today: str, days: int) -> set[str]:
 def streamer_short(
     pool: list[Candidate], name: str, config: dict, today: str, game: str | None = None
 ) -> dict | None:
-    """Short de un solo streamer: sus mejores momentos del día, del más visto al menos."""
+    """Short de un solo streamer: primero el pico de chat y de sonido, no el clip más largo."""
     name = pool[0].streamer if pool else name
-    print(f"\nShort de @{name}: {len(pool)} clips en las últimas 24 h")
+    pool = rank_clips(pool)
+    print(f"\nShort de @{name}: {len(pool)} clips en las últimas 24 h, ordenados por el pico")
     if game:
         title = [[("@" + name.upper(), True)], [("EN " + game.upper(), False)]]
         headline = f"Lo mejor de {name} en {game} hoy"
