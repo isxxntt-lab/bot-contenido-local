@@ -29,9 +29,3 @@ Desktop.ini
 
 # Credenciales de YouTube (client_secret.json y token)
 credenciales/
-
-# Credenciales locales de n8n (no versionar)
-n8n/CREDENCIALES-LOCAL.txt
-
-# El ejemplo de claves sí se versiona (va sin valores)
-!n8n/.env.n8n.example

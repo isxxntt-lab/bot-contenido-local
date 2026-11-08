@@ -1,43 +1,65 @@
-# Bot de contenido local
+# Clipazos ES
 
-Bot autónomo que lee noticias de tecnología e IA desde feeds RSS públicos y arma posts de texto con reglas locales. No usa APIs de pago ni modelos en la nube.
+Bot local que monta Shorts verticales en español con los mejores clips de
+streamers de Twitch y Kick y de youtubers. Busca los clips, los transcribe,
+encuadra la webcam del streamer, quema subtítulos palabra a palabra y, si está
+activado, sube el resultado a YouTube Shorts.
 
-## Requisitos
+## Archivos
 
-Python 3.11 o superior.
+- `clipazos.py`: flujo diario. Localiza clips (Twitch, Kick y YouTube con `yt-dlp`),
+  transcribe con `faster-whisper`, detecta la cara con el modelo YuNet de
+  `assets/models/` y monta el Short con FFmpeg.
+- `semanal.py`: resumen semanal largo de los streamers configurados.
+- `video_editor.py`: utilidades comunes de subtítulos ASS y FFmpeg.
+- `youtube_upload.py`: subida a YouTube con la API oficial (OAuth).
+- `clipazos.json`: configuración (streamers de Kick, categorías de Twitch, canales
+  de YouTube, duración, privacidad de la subida, días que se guardan los vídeos...).
+- `run_clipazos.bat`: lanzador que usa el venv y guarda el log.
+- `autorizar_youtube.bat`: autoriza la cuenta de YouTube la primera vez.
+
+## Instalación
+
+Python 3.11 o superior, en Windows (PowerShell), desde esta carpeta:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+```
+
+Comprobación rápida:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import clipazos, semanal, youtube_upload"
 ```
 
 ## Uso
 
-Desde esta carpeta, con el entorno virtual activo:
-
 ```powershell
-python main.py
-python main.py --limit 2
+.\run_clipazos.bat
 ```
 
-Los posts quedan en `output/` (esa carpeta no se versiona). `output/latest.txt` y `output/latest.json` son siempre el último resultado.
+El `.bat` activa `.venv`, ejecuta `clipazos.py` y deja los vídeos y los reportes
+en `output\clipazos\`. La última ejecución queda en `output\clipazos\ultimo_run.log`
+y todas se acumulan en `output\clipazos\historial.log`. La carpeta `output/` no se
+versiona.
 
-## Módulos
+La tarea programada de Windows `BotContenidoLocal` lanza `run_clipazos.bat`
+automáticamente.
 
-- `scraper.py`: descarga título, enlace y resumen desde TechCrunch, The Verge y WIRED.
-- `formatter.py`: asigna hashtags por palabras clave y rellena una plantilla de texto.
-- `main.py`: orquesta el flujo y guarda el resultado.
+## Subida a YouTube
 
-Para añadir un hashtag, edita `KEYWORD_HASHTAGS` en `formatter.py`.
+La subida está en `youtube_upload.py` y se controla con `subida_youtube` en
+`clipazos.json` (`activa` y `privacidad`).
 
-## Flujo híbrido con n8n (opcional)
+1. Crea en Google Cloud un cliente OAuth de tipo "App de escritorio" y guarda el
+   JSON como `credenciales\client_secret.json`.
+2. Ejecuta `autorizar_youtube.bat` una vez. El token queda en
+   `credenciales\youtube_token.json`.
 
-Si defines `N8N_WEBHOOK_URL` y `N8N_API_KEY`, `main.py` envía cada noticia al
-workflow de n8n: b-roll de Pexels, render vertical con JSON2Video (subtítulos
-dinámicos palabra a palabra) y aviso con el MP4 por Telegram. Sin esas variables,
-el bot usa el montaje 100% local de `video_editor.py` como plan B.
+## Credenciales
 
-- Workflow importable y docker-compose de n8n: carpeta `n8n/`.
-- Contrato de datos, arquitectura y puesta en marcha: `docs/ARQUITECTURA-HIBRIDA.md`.
-- Claves de servicios (Pexels, JSON2Video, Telegram): `n8n/.env.n8n.example`.
+La carpeta `credenciales/` (con `client_secret.json` y `youtube_token.json`) y
+cualquier `.env` están en `.gitignore` y **no se suben nunca** a git.
