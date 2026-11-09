@@ -43,5 +43,49 @@
     "privacidad": "public"
   },
   "dias_guardar_videos": 14,
-  "excluir_streamers": []
+  "excluir_streamers": [],
+  "publication": {
+    "kill_switch": false,
+    "kill_switch_file": "STOP_YOUTUBE",
+    "max_por_dia": 3,
+    "max_por_ejecucion": 3,
+    "max_por_streamer_dia": 1,
+    "zona_horaria": "Europe/Madrid",
+    "db_path": "data/publicaciones.sqlite3"
+  },
+  "rights": {
+    "unknown_permission_policy": "block",
+    "allowed_sources": ["Twitch", "Kick", "YouTube"],
+    "blocked_sources": [],
+    "blocked_streamers": [],
+    "streamers": {},
+    "blocked_terms": ["casino", "apuestas", "slots", "nsfw", "+18"],
+    "blocked_patterns": [],
+    "third_party_risk_terms": ["música", "canción", "concierto", "videoclip", "película", "pelicula", "serie", "trailer", "tráiler", "partido", "fútbol", "futbol", "champions", "laliga", "la liga", "mundial", "dazn", "netflix", "hbo", "disney", "anime", "dmca", "copyright", "reacciona", "reaccionando", "reacción a", "watch party"],
+    "third_party_risk_policy": "block"
+  },
+  "qa": {
+    "activa": true,
+    "ancho": 1080,
+    "alto": 1920,
+    "fps": 24,
+    "fps_tolerancia": 0.5,
+    "duracion_min": 10,
+    "duracion_max": 180,
+    "lufs_min": -18,
+    "lufs_max": -10,
+    "negro_max_segundos": 1.0,
+    "negro_umbral_pixel": 0.10,
+    "congelado_max_segundos": 2.0,
+    "congelado_ruido_db": -60,
+    "subtitulos_obligatorios": true,
+    "subtitulos_min_eventos": 3,
+    "timeout_segundos": 600,
+    "caras": {
+      "activa": false,
+      "muestras": 8,
+      "min_fotogramas_con_cara": 1,
+      "puntuacion_min": 0.7
+    }
+  }
 }

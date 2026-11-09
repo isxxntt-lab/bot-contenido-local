@@ -29,3 +29,19 @@ Desktop.ini
 
 # Credenciales de YouTube (client_secret.json y token)
 credenciales/
+
+# Guardia de publicación: base SQLite con reservas y subidas (no versionar)
+data/
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+
+# Kill switch por archivo (se crea a mano para parar las subidas)
+STOP_YOUTUBE
+
+# Temporales de QA y de las pruebas
+*.part
+.qa_tmp/
+tests/_tmp/

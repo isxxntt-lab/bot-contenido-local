@@ -1,0 +1,2 @@
+# Solo para desarrollo y pruebas (no hace falta para ejecutar el bot).
+pytest>=8.2

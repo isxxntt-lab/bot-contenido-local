@@ -12,6 +12,11 @@ Flujo 100 % local y sin claves:
   5. FFmpeg monta el vertical: fondo desenfocado, clip centrado, título, crédito
      del streamer y subtítulos con la palabra activa en amarillo.
 
+Antes de descargar o editar un clip se comprueban los derechos (rights.py); después
+del montaje, el QA bloqueante (qa.py); y antes de subir, la guardia de publicación
+(publication_guard.py: kill switch, cupos y duplicados). --dry-run hace todo menos
+llamar a la API de YouTube.
+
 La configuración del canal vive en clipazos.json.
 """
 
@@ -31,6 +36,9 @@ from pathlib import Path
 
 import numpy as np
 
+import publication_guard
+import qa
+import rights
 from video_editor import (
     ACTIVE_ASS,
     BASE_DIR,
@@ -53,6 +61,9 @@ CLIPAZOS_DIR = OUTPUT_DIR / "clipazos"
 CACHE_DIR = CLIPAZOS_DIR / "cache"
 RADAR_PATH = CLIPAZOS_DIR / "radar.json"
 CACHE_DAYS = 3
+# Sufijo de los archivos de una ejecución --dry-run, para no pisar los de verdad.
+DRY_RUN_SUFFIX = "_dryrun"
+_RUN_SUFFIX = ""
 
 SAMPLE_RATE = 16_000
 FRAME_STEP = 0.25
@@ -853,6 +864,10 @@ def collect_moments(
         if len(moments) >= limit or total >= target - 3:
             break
         room = max(shortest, min(longest, target - total + 6))
+        decision = rights.check_candidate(candidate, config)
+        if not decision.allowed:
+            print(f"  Salto @{candidate.streamer} ({candidate.platform}) por derechos: {decision.reason}", file=sys.stderr)
+            continue
         try:
             moment = build_moment(candidate, shortest, room, language)
         except Exception as exc:  # noqa: BLE001 - un clip roto no debe parar el vídeo
@@ -1123,7 +1138,18 @@ def make_short(
     post = post_text(moments, headline, extra_tags)
     post["video"] = str(destination)
     post["duracion"] = round(sum(moment.length for moment in moments), 1)
+    unique = list({moment.candidate.key: moment.candidate for moment in moments}.values())
+    post["clips"] = [candidate.key for candidate in unique]
+    post["fuentes"] = [rights.source_info(candidate) for candidate in unique]
     print(f"  Vídeo: {destination} ({post['duracion']}s, {destination.stat().st_size} bytes)")
+    result = qa.run_qa(destination, config, destination.with_suffix(".ass"))
+    post["qa"] = result.to_dict()
+    if result.passed:
+        print("  QA: ok" + (" (desactivado)" if result.skipped else ""))
+    else:
+        post["no_subir"] = True
+        post["bloqueado_por"] = "qa"
+        print(f"  QA bloquea la subida: {result.reason}", file=sys.stderr)
     return post
 
 
@@ -1136,6 +1162,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--clips", type=int, help="Máximo de clips por vídeo (clips_maximos).")
     parser.add_argument("--segundos", type=float, help="Duración objetivo del Short (segundos_objetivo).")
     parser.add_argument("--forzar", action="store_true", help="Rehace los Shorts aunque ya estén hechos hoy.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Hace todo (buscar, descargar, montar, derechos, QA y cupos) menos llamar a la API de YouTube.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1170,6 +1201,8 @@ def recently_posted(today: str, days: int) -> set[str]:
     limit = (datetime.strptime(today, "%Y%m%d") - timedelta(days=days)).strftime("%Y%m%d")
     names: set[str] = set()
     for path in CLIPAZOS_DIR.glob("reporte_*.json"):
+        if path.stem.endswith(DRY_RUN_SUFFIX):
+            continue
         day = path.stem.split("_")[1]
         if not (limit <= day < today):
             continue
@@ -1198,31 +1231,55 @@ def streamer_short(
         tags = []
     short = make_short(
         pool, config, title, headline,
-        CLIPAZOS_DIR / f"streamer_{_safe_name(name).lower()}_{today}.mp4", tags,
+        CLIPAZOS_DIR / f"streamer_{_safe_name(name).lower()}_{today}{_RUN_SUFFIX}.mp4", tags,
     )
     if short:
         short["streamer"] = name
     return short
 
 
-def _upload(config: dict, report_path: Path) -> None:
+def apply_rights(candidates: list[Candidate], config: dict, label: str) -> list[Candidate]:
+    """Quita los clips sin permiso antes de descargar nada."""
+    allowed, blocked = rights.filter_candidates(candidates, config)
+    if blocked:
+        names = sorted({candidate.streamer for candidate, _decision in blocked}, key=str.casefold)
+        shown = ", ".join("@" + name for name in names[:8]) + (" ..." if len(names) > 8 else "")
+        print(f"Derechos {label}: {len(blocked)} de {len(candidates)} clips bloqueados ({shown})")
+        print(f"  Primer motivo: {blocked[0][1].reason}")
+    return allowed
+
+
+def _upload(
+    config: dict, report_path: Path, config_path: Path | None = None, dry_run: bool = False
+) -> None:
     """Sube a YouTube los Shorts del reporte que aún no estén subidos."""
     upload = config.get("subida_youtube", {})
     if not upload.get("activa"):
         return
     import youtube_upload
 
+    privacy = publication_guard.resolve_privacy(config)
+    if dry_run:
+        print("\n--dry-run: se comprueba la subida a YouTube sin llamar a la API...")
+        youtube_upload.upload_report(
+            report_path, privacy, config=config, config_path=config_path or CONFIG_PATH, dry_run=True
+        )
+        return
     if youtube_upload.is_ready():
         print("\nSubiendo a YouTube...")
-        youtube_upload.upload_report(report_path, upload.get("privacidad", "private"))
+        youtube_upload.upload_report(report_path, privacy, config=config, config_path=config_path or CONFIG_PATH)
     else:
         print("\nSubida a YouTube activa pero sin autorizar: ejecuta autorizar_youtube.bat")
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _RUN_SUFFIX
     _utf8_stdio()
     args = parse_args(argv)
     config = load_config(args.config)
+    _RUN_SUFFIX = DRY_RUN_SUFFIX if args.dry_run else ""
+    if args.dry_run:
+        print("Modo --dry-run: no se llamará a la API de YouTube.")
     if args.clips:
         config["clips_maximos"] = args.clips
     if args.segundos:
@@ -1239,7 +1296,7 @@ def main(argv: list[str] | None = None) -> int:
             done = []
         if done:
             print(f"{channel}: los Shorts de hoy ya están hechos ({len(done)}). Usa --forzar para rehacerlos.")
-            _upload(config, daily_report)
+            _upload(config, daily_report, args.config, args.dry_run)
             return 0
     print(f"{channel}: buscando momentazos de las últimas 24 h...")
     clean_cache(keep_videos=int(config.get("dias_guardar_videos", 14)))
@@ -1261,6 +1318,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  HYPE {game}: {views} vistas hoy (media {baseline:.0f})")
     for name, views, baseline in rising:
         print(f"  Subiendo @{name}: {views} vistas hoy (media {baseline:.0f})")
+
+    # Derechos antes de descargar o editar: el radar usa todos los clips, el resto solo los permitidos.
+    twitch = apply_rights(twitch, config, "Twitch")
+    kick = apply_rights(kick, config, "Kick")
+    youtube = apply_rights(youtube, config, "YouTube")
 
     report = {
         "canal": channel,
@@ -1303,13 +1365,13 @@ def main(argv: list[str] | None = None) -> int:
 
     CLIPAZOS_DIR.mkdir(parents=True, exist_ok=True)
     suffix = f"_{_safe_name(args.streamer.lstrip('@')).lower()}" if args.streamer else ""
-    report_path = CLIPAZOS_DIR / f"reporte_{today}{suffix}.json"
+    report_path = CLIPAZOS_DIR / f"reporte_{today}{suffix}{_RUN_SUFFIX}.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     for short in report["shorts"]:
         print(f"\n{short['titulo']}\n{short['descripcion']}\n{' '.join(short['hashtags'])}")
     print(f"\nReporte: {report_path}")
     if report["shorts"]:
-        _upload(config, report_path)
+        _upload(config, report_path, args.config, args.dry_run)
     if not args.solo_radar and not report["shorts"]:
         return 1
     return 0
