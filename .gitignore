@@ -45,3 +45,6 @@ STOP_YOUTUBE
 *.part
 .qa_tmp/
 tests/_tmp/
+
+# Exportaciones para TikTok (vídeos generados)
+export_tiktok/

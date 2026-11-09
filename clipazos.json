@@ -111,5 +111,15 @@
       "min_palabras": 6,
       "obligatorios": ["inicio_completo", "final_completo", "remate", "duracion"]
     }
+  },
+  "tiktok_export": {
+    "enabled": true,
+    "carpeta": "export_tiktok",
+    "hashtags_base": ["#clipazos", "#streamers", "#clipsespañol", "#fyp"],
+    "max_hashtags": 10,
+    "optimizar_video": true,
+    "portada_muestras": 9,
+    "portada_ventana_segundos": 2.0,
+    "timeout_segundos": 300
   }
 }

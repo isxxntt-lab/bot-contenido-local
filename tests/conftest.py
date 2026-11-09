@@ -106,3 +106,11 @@ def allowed_config(tmp_path: Path, **publication) -> dict:
         "rights": {"streamers": {"twitch:ana": {"estado": "allowed"}, "twitch:beto": "allowed"}},
         "qa": {"duracion_min": 1, "duracion_max": 60},
     }
+
+
+@pytest.fixture(autouse=True)
+def _export_tiktok_temporal(tmp_path, monkeypatch):
+    """Las pruebas nunca escriben en la carpeta export_tiktok/ real."""
+    import tiktok_export
+
+    monkeypatch.setattr(tiktok_export, "export_root", lambda config=None: tmp_path / "export_tiktok")

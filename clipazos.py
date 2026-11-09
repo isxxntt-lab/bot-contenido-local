@@ -45,6 +45,7 @@ import narrative_segments
 import publication_guard
 import qa
 import rights
+import tiktok_export
 from video_editor import (
     ACTIVE_ASS,
     BASE_DIR,
@@ -1304,16 +1305,61 @@ def make_short(
     post["clips"] = [candidate.key for candidate in unique]
     post["fuentes"] = [rights.source_info(candidate) for candidate in unique]
     post["seleccion"] = _SELECTION_LOG[first_log:]
+    post["cortes"], post["picos_short"] = _cut_info(moments)
     print(f"  Vídeo: {destination} ({post['duracion']}s, {destination.stat().st_size} bytes)")
     result = qa.run_qa(destination, config, destination.with_suffix(".ass"))
     post["qa"] = result.to_dict()
     if result.passed:
         print("  QA: ok" + (" (desactivado)" if result.skipped else ""))
+        _export_tiktok(post, config)
     else:
         post["no_subir"] = True
         post["bloqueado_por"] = "qa"
         print(f"  QA bloquea la subida: {result.reason}", file=sys.stderr)
     return post
+
+
+def _cut_info(moments: list[Moment]) -> tuple[list[dict], list[float]]:
+    """Tramos usados de cada clip (segundos del clip) y el pico en segundos del Short."""
+    cuts: list[dict] = []
+    peaks: list[float] = []
+    offset = 0.0
+    for moment in moments:
+        peak = round(offset + moment.peak, 2)
+        cuts.append({
+            "clip": moment.candidate.key,
+            "inicio_clip": round(moment.start, 2),
+            "fin_clip": round((moment.segment or {}).get("end", moment.start + moment.length), 2),
+            "trozos_clip": [[round(left, 2), round(right, 2)] for left, right in moment.cuts],
+            "inicio_short": round(offset, 2),
+            "duracion_final": round(moment.length, 2),
+            "pico_short": peak,
+        })
+        peaks.append(peak)
+        offset += moment.length
+    return cuts, peaks
+
+
+def _export_tiktok(post: dict, config: dict) -> None:
+    """Carpeta lista para TikTok. Nunca bloquea YouTube: un fallo se apunta y se sigue."""
+    if not tiktok_export.settings_from(config)["enabled"]:
+        return
+    try:
+        manifest = tiktok_export.export_short(post, config, dry_run=_RUN_SUFFIX == DRY_RUN_SUFFIX)
+    except Exception as exc:  # noqa: BLE001 - la exportación es secundaria
+        post["tiktok_export"] = {"estado": "error", "motivo": str(exc)}
+        print(f"  Aviso: no se pudo exportar para TikTok ({exc})", file=sys.stderr)
+        return
+    folder = str(Path(manifest["archivos"]["manifest.json"]).parent)
+    post["tiktok_export"] = {"estado": "ok", "carpeta": folder, "manifest": manifest["archivos"]["manifest.json"]}
+    print(f"  TikTok: listo en {folder} (portada: {manifest['portada']['metodo']})")
+
+
+def _refresh_tiktok(config: dict, report_path: Path, dry_run: bool) -> None:
+    try:
+        tiktok_export.refresh_youtube(report_path, config, dry_run)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  Aviso: no se pudo actualizar el estado de YouTube en export_tiktok ({exc})", file=sys.stderr)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1466,6 +1512,7 @@ def main(argv: list[str] | None = None) -> int:
         if done:
             print(f"{channel}: los Shorts de hoy ya están hechos ({len(done)}). Usa --forzar para rehacerlos.")
             _upload(config, daily_report, args.config, args.dry_run)
+            _refresh_tiktok(config, daily_report, args.dry_run)
             return 0
     print(f"{channel}: buscando momentazos de las últimas 24 h...")
     clean_cache(keep_videos=int(config.get("dias_guardar_videos", 14)))
@@ -1542,6 +1589,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nReporte: {report_path}")
     if report["shorts"]:
         _upload(config, report_path, args.config, args.dry_run)
+        _refresh_tiktok(config, report_path, args.dry_run)
     if not args.solo_radar and not report["shorts"]:
         return 1
     return 0

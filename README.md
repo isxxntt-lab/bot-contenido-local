@@ -14,6 +14,7 @@ activado, sube el resultado a YouTube Shorts.
 - `youtube_upload.py`: subida a YouTube con la API oficial (OAuth).
 - `narrative_segments.py`: divide la transcripción en frases y unidades narrativas.
 - `clip_judge.py`: juez local que puntúa si un momento tiene arco completo.
+- `tiktok_export.py`: deja cada Short aprobado listo para subir a TikTok a mano.
 - `rights.py`: política de derechos (qué streamers y fuentes se pueden usar).
 - `qa.py`: control de calidad bloqueante del vídeo montado.
 - `publication_guard.py`: kill switch, cupos y duplicados de YouTube (SQLite).
@@ -117,6 +118,33 @@ justo a continuación del primero (hueco de como mucho `union_max_hueco_segundos
 entre la última palabra de uno y la primera del otro). Si no, se usa uno solo.
 `segundos_objetivo` solo limita la suma en ese caso; `clips_maximos`,
 `segundos_min_clip` y `segundos_max_clip` ya no deciden la selección.
+
+## Exportación para TikTok
+
+Cada Short que aprueban el juez y el QA se copia también a
+`export_tiktok/<fecha>_<streamer>_<titulo>/` (en el PC:
+`C:\Users\pc\Proyecto Bot contenido\export_tiktok\`; con `--dry-run` la carpeta
+acaba en `_dryrun`). No se sube nada a TikTok:
+
+- `video.mp4`: el Short. Si no es ya H.264 + AAC 1080x1920 con faststart se
+  convierte y se verifica (ffprobe, o `ffmpeg -i` si no hay ffprobe); si algo falla
+  se copia el original tal cual.
+- `caption.txt`: título, clip y crédito al streamer original (con enlace) y los
+  hashtags, listo para pegar. Solo usa datos del pipeline.
+- `cover.jpg`: fotograma 1080x1920 del propio vídeo. Se prueban fotogramas
+  alrededor del pico (±`portada_ventana_segundos`) y repartidos por el vídeo; gana
+  el que tiene la cara más grande y clara (YuNet), luego la cercanía al pico y la
+  nitidez. Sin caras (o sin el modelo), el fotograma más nítido junto al pico.
+- `manifest.json`: id, streamer, plataforma, URL, tramos del corte, duración, nota
+  y motivos del juez, QA, segundo y método de la portada, fecha en Europe/Madrid,
+  rutas y estado de YouTube (subido, bloqueado por derechos o por la guardia,
+  pendiente o dry-run). Tras la subida se actualiza con el estado real.
+
+Un fallo de exportación se apunta en el reporte (`tiktok_export`) y no frena la
+subida a YouTube. Config en el bloque `tiktok_export` (`enabled`, `carpeta`,
+`hashtags_base`, `max_hashtags`, `optimizar_video`, `portada_muestras`,
+`portada_ventana_segundos`, `timeout_segundos`). Para exportar un reporte ya hecho:
+`.\.venv\Scripts\python.exe tiktok_export.py output\clipazos\reporte_AAAAMMDD.json`.
 
 ## Seguridad de publicación
 
