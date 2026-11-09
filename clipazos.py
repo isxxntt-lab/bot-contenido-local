@@ -52,6 +52,7 @@ from video_editor import (
     FPS,
     FRAME_SIZE,
     OUTPUT_DIR,
+    SPLIT_TOP,
     CaptionCue,
     _ass_clock,
     _ass_word,
@@ -108,7 +109,6 @@ NON_GAMES = {
 VIDEO_TOP = (FRAME_SIZE[1] - FRAME_SIZE[0] * 9 // 16) // 2
 FACE_MODEL = BASE_DIR / "assets" / "models" / "face_detection_yunet_2023mar.onnx"
 SCAN_SIZE = (1280, 720)
-SPLIT_TOP = 840
 FOLLOW_BOX = (1080, 1440)
 SOURCE_KEEP = 0.86
 INTRO_SECONDS = 3.0
@@ -1070,6 +1070,19 @@ def _source_label(candidate: Candidate, channel: str) -> str:
     return f"{channel.upper()} · {home.get(candidate.platform, '')}{candidate.streamer.upper()}"
 
 
+def split_caption_margin_v() -> int:
+    """MarginV de CaptionSplit (alineación 8, desde el borde superior).
+
+    El valor antiguo, SPLIT_TOP - 55, dejaba el renglón dentro de la webcam.
+    Medido con Arial Black, borde 5, sombra 3, \\fs 78-124 y el golpe al 130 %:
+    la tinta queda por debajo de MarginV y, con ese margen, invadía la banda
+    (la más alta, una palabra con tildes, empezaba en y=797; la cámara acaba
+    en y=840). El renglón arranca en SPLIT_TOP y el texto cae en la zona de juego.
+    No hay clave de configuración: follow y blur siguen con sus márgenes.
+    """
+    return SPLIT_TOP
+
+
 def _pop(text: str) -> str:
     """La palabra entra un 30 % más grande y vuelve a su tamaño en 0,1 s."""
     active = YELLOW[:-1] + "\\fscx130\\fscy130\\t(0,100,\\fscx100\\fscy100)}"
@@ -1119,7 +1132,7 @@ def write_short_captions(
         f"Style: Credit,Arial Black,48,{style},1,4,2,8,60,60,110,1",
         f"Style: Caption,Arial Black,76,{style},1,4,3,8,60,60,"
         f"{(height + int(width * SOURCE_KEEP * 9 / 16)) // 2 + 50},1",
-        f"Style: CaptionSplit,Arial Black,80,{style},1,5,3,8,60,60,{SPLIT_TOP - 55},1",
+        f"Style: CaptionSplit,Arial Black,80,{style},1,5,3,8,60,60,{split_caption_margin_v()},1",
         f"Style: CaptionFollow,Arial Black,80,{style},1,5,3,2,60,60,"
         f"{(height - FOLLOW_BOX[1]) // 2 + 120},1",
         "Style: Brand,Arial Black,40,&H40FFFFFF,&H000000FF,&H40000000,&H00000000,"

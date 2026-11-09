@@ -9,6 +9,7 @@ Comprueba:
 - que haya audio y su sonoridad integrada (LUFS, filtro ebur128);
 - tramos negros (blackdetect) y congelados (freezedetect);
 - subtítulos: el .ass del Short existe y tiene suficientes líneas de subtítulo;
+- geometría de CaptionSplit: el renglón no entra en la banda de la webcam ni se sale del lienzo;
 - caras con YuNet (opcional, desactivado por defecto).
 
 ffprobe se usa si está en el PATH; si no, se lee la salida de ``ffmpeg -i``
@@ -24,7 +25,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from video_editor import BASE_DIR, _ffmpeg_exe
+from video_editor import BASE_DIR, FRAME_SIZE, SPLIT_TOP, _ffmpeg_exe
 
 FACE_MODEL = BASE_DIR / "assets" / "models" / "face_detection_yunet_2023mar.onnx"
 
@@ -230,6 +231,123 @@ def analyze(path: Path, settings: dict, has_audio: bool, duration: float | None)
     return metrics
 
 
+def check_caption_geometry(ass_path: Path | None) -> tuple[list[str], dict]:
+    """Comprueba que CaptionSplit quede debajo de la webcam y dentro del fotograma.
+
+    Solo actúa si el .ass declara el estilo CaptionSplit (los de prueba que solo
+    nombran el estilo en un Dialogue no se tocan). Alignment 8: MarginV es el
+    borde superior del renglón. La tinta medida cae por debajo de ese borde, así
+    que con MarginV >= SPLIT_TOP el texto no entra en la cámara. El golpe al
+    130 % crece hacia abajo; el borde inferior suma líneas, contorno y sombra.
+    """
+    metrics: dict = {"split_eventos": 0}
+    if ass_path is None or not Path(ass_path).is_file():
+        return [], metrics
+    try:
+        text = Path(ass_path).read_text(encoding="utf-8-sig", errors="replace")
+    except OSError as exc:
+        return [f"no se pudo leer la geometría de los subtítulos ({exc})"], metrics
+    styles = _ass_styles(text)
+    style = styles.get("CaptionSplit")
+    if style is None:
+        return [], metrics
+    play_x, play_y = _play_res(text)
+    facecam = int(round(SPLIT_TOP * play_y / FRAME_SIZE[1]))
+    reasons: list[str] = []
+    if style["alignment"] != 8:
+        reasons.append(
+            f"CaptionSplit no usa alineación superior (tiene {style['alignment']}); "
+            "no se puede asegurar que el texto quede fuera de la webcam"
+        )
+    bottoms: list[float] = []
+    tops: list[float] = []
+    for event in _caption_split_events(text):
+        metrics["split_eventos"] += 1
+        if style["alignment"] != 8:
+            continue
+        if re.search(r"\\(?:pos|move|org|frz|frx|fry|fax|fay|clip)\s*\(", event["text"]):
+            reasons.append("subtítulo split con posición libre; no se puede comprobar la webcam")
+            continue
+        margin_v = event["margin_v"] if event["margin_v"] else style["margin_v"]
+        fontsize = event["fontsize"] or style["fontsize"]
+        scale = max(event["scale"], style["scale_y"] / 100.0, 1.0)
+        top = float(margin_v)
+        bottom = top + (fontsize * event["lineas"] + style["outline"] + style["shadow"]) * scale
+        tops.append(top)
+        bottoms.append(bottom)
+        if top < facecam:
+            reasons.append(
+                f"subtítulo split dentro de la webcam (borde superior en {top:.0f}, la cámara acaba en {facecam})"
+            )
+        if bottom > play_y or top < 0:
+            reasons.append(
+                f"subtítulo split fuera del lienzo (y {top:.0f}-{bottom:.0f}, alto {play_y})"
+            )
+    if tops:
+        metrics["split_y0"] = min(tops)
+        metrics["split_y1"] = max(bottoms)
+        metrics["split_facecam"] = facecam
+    return list(dict.fromkeys(reasons)), metrics
+
+
+def _play_res(text: str) -> tuple[int, int]:
+    width = re.search(r"(?m)^PlayResX:\s*(\d+)", text)
+    height = re.search(r"(?m)^PlayResY:\s*(\d+)", text)
+    return (
+        int(width.group(1)) if width else FRAME_SIZE[0],
+        int(height.group(1)) if height else FRAME_SIZE[1],
+    )
+
+
+def _ass_styles(text: str) -> dict[str, dict]:
+    found: dict[str, dict] = {}
+    for line in text.splitlines():
+        if not line.startswith("Style:"):
+            continue
+        parts = [part.strip() for part in line.split(":", 1)[1].split(",")]
+        if len(parts) < 23:
+            continue
+        try:
+            found[parts[0]] = {
+                "fontsize": float(parts[2]),
+                "scale_y": float(parts[12]),
+                "outline": float(parts[16]),
+                "shadow": float(parts[17]),
+                "alignment": int(float(parts[18])),
+                "margin_v": int(float(parts[21])),
+            }
+        except ValueError:
+            continue
+    return found
+
+
+def _caption_split_events(text: str) -> list[dict]:
+    events: list[dict] = []
+    for line in text.splitlines():
+        if not line.startswith("Dialogue:"):
+            continue
+        fields = line.split(":", 1)[1].split(",", 9)
+        if len(fields) < 10 or fields[3].strip() != "CaptionSplit":
+            continue
+        body = fields[9]
+        try:
+            margin_v = int(float(fields[7].strip() or 0))
+        except ValueError:
+            margin_v = 0
+        sizes = [int(value) for value in re.findall(r"\\fs(\d+)", body)]
+        scales = [int(value) for value in re.findall(r"\\fsc[xy](\d+)", body)]
+        plain = re.sub(r"\{[^}]*\}", "", body)
+        lines = re.split(r"\\N", plain)
+        events.append({
+            "text": body,
+            "margin_v": margin_v,
+            "fontsize": max(sizes) if sizes else 0,
+            "scale": (max(scales) / 100.0) if scales else 1.0,
+            "lineas": max(1, len(lines)),
+        })
+    return events
+
+
 def check_subtitles(ass_path: Path | None, settings: dict) -> tuple[list[str], dict]:
     if ass_path is None or not Path(ass_path).is_file():
         return ([f"faltan los subtítulos ({Path(ass_path).name if ass_path else 'sin .ass'})"], {"subtitulos": 0})
@@ -329,10 +447,15 @@ def run_qa(video_path: Path | str, config: dict | None, ass_path: Path | str | N
     for start, length in analysis.get("congelados", []):
         if length >= limit_freeze:
             reasons.append(f"imagen congelada {length:.2f} s desde {start:.2f} s")
+    ass_file = Path(ass_path) if ass_path else None
     if settings["subtitulos_obligatorios"]:
-        sub_reasons, sub_metrics = check_subtitles(Path(ass_path) if ass_path else None, settings)
+        sub_reasons, sub_metrics = check_subtitles(ass_file, settings)
         reasons.extend(sub_reasons)
         metrics.update(sub_metrics)
+    if ass_file is not None and ass_file.is_file():
+        geo_reasons, geo_metrics = check_caption_geometry(ass_file)
+        reasons.extend(geo_reasons)
+        metrics.update(geo_metrics)
     if settings["caras"]["activa"]:
         try:
             face_reasons, face_metrics = check_faces(path, settings, duration)
