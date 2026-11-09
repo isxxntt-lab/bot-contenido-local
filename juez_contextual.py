@@ -9,6 +9,7 @@ se trata como abstención.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import subprocess
 import urllib.error
@@ -241,9 +242,9 @@ class OllamaVision:
             trace["error"] = "salida cortada por num_predict; no se completa a mano"
         return trace
 
-    def preflight(self, prompt: str, images: list[str]) -> dict:
+    def preflight(self, prompt: str, images: list[str], cuerpo: dict | None = None) -> dict:
         """Mide la entrada completa. Genera un token y lo descarta; no es un juicio."""
-        juicio = build_request(self.model, prompt, images, self.num_ctx, self.keep_alive)
+        juicio = cuerpo if cuerpo is not None else build_request(self.model, prompt, images, self.num_ctx, self.keep_alive)
         enviado = cuerpo_preflight(juicio)
         trace = {
             "raw": "",
@@ -283,6 +284,15 @@ class OllamaVision:
         trace["done_reason"] = payload.get("done_reason")
         trace["prompt_eval_count"] = payload.get("prompt_eval_count")
         trace["eval_count"] = payload.get("eval_count")
+        trace["bitacora"] = []
+        trace["cuerpo_sha256"] = hashlib.sha256(
+            json.dumps(enviado, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        trace["correlacion"] = {
+            "valida": False,
+            "truncated": None,
+            "motivo": "la API no devuelve truncated y esta sesión no tiene bitácora ligada",
+        }
         if payload.get("load_duration") is not None:
             trace["load_duration_ms"] = round(payload["load_duration"] / 1e6, 1)
         if payload.get("total_duration") is not None:

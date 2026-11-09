@@ -118,14 +118,14 @@ def test_sin_medicion_de_backend_el_presupuesto_queda_desconocido():
         "num_predict": paquete_contextual.NUM_PREDICT,
     }
     plan, reason = paquete_contextual.preparar_llamada(package, measured)
-    assert plan is None and "trunc" in reason
+    assert plan is None and "correlación" in reason
     con_prueba = _package()
     con_prueba["truncado"] = 0
     plan, reason = paquete_contextual.preparar_llamada(con_prueba, measured)
-    assert reason == ""
-    assert plan == paquete_contextual.frame_plan(_cuts())
+    assert plan is None and "correlación" in reason
     too_big = dict(measured, prompt_eval_count=paquete_contextual.NUM_CTX)
     plan, reason = paquete_contextual.preparar_llamada(con_prueba, too_big)
+    assert plan is None and "presupuesto" in reason
     assert plan is None and "presupuesto" in reason
 
 
@@ -215,33 +215,54 @@ def test_la_entrada_del_preflight_es_la_del_paquete_y_deja_fuera_el_contexto():
     assert huella != paquete_contextual.huella_entrada(prompt, juez_contextual.OUTPUT_SCHEMA, ["a", "b", "d"], 5120)
 
 
-def test_el_preflight_se_cierra_si_el_presupuesto_no_cabe_o_la_entrada_cambia():
+def test_el_preflight_se_cierra_sin_correlacion_de_esta_llamada():
     package = _package()
-    huella = "misma"
-    medido = paquete_contextual.aplicar_preflight(package, _trace(100), huella, huella)
-    assert medido["preflight"]["aplicada"] is False
-    assert medido["presupuesto"]["tokens_entrada"] is None
-    assert medido["truncado"] is None if "truncado" in medido else True
-    explicito = paquete_contextual.aplicar_preflight(
-        package, _trace(100, truncated=0, truncado_origen="log"), huella, huella,
-    )
-    assert explicito["presupuesto"]["cabe"] is True
-    assert explicito["truncado"] == 0
-    assert explicito["ensayo_hecho"] is False
-    grande = paquete_contextual.aplicar_preflight(package, _trace(5000, truncated=0), huella, huella)
-    assert grande["presupuesto"]["cabe"] is False
-    assert "presupuesto" in paquete_contextual.motivo_de_bloqueo(grande)
-    distinta = paquete_contextual.aplicar_preflight(package, _trace(100), huella, "otra")
-    assert distinta["preflight"]["aplicada"] is False
-    assert distinta["presupuesto"]["estado"] == "desconocido"
-    truncada = paquete_contextual.aplicar_preflight(
-        package, _trace(None, error="HTTP 400: request exceeds the available context size", prompt_eval_count=None),
-        huella, huella,
-    )
-    assert truncada["preflight"]["aplicada"] is False
-    assert truncada["presupuesto"]["tokens_entrada"] is None
-    con_texto = paquete_contextual.aplicar_preflight(package, _trace(100, raw='{"decision":"accept"}'), huella, huella)
-    assert con_texto["preflight"]["aplicada"] is False
+    inst = {"huella": "h", "cuerpo_sha256": "cuerpo", "campos": {"prompt": "p"}}
+    base = {
+        "raw": "",
+        "prompt_eval_count": 4799,
+        "eval_count": 1,
+        "done_reason": "length",
+        "error": None,
+        "num_ctx": paquete_contextual.NUM_CTX,
+        "num_predict_enviado": 1,
+        "sesion_id": "s1",
+        "modelo": "modelo",
+        "digest": "digest",
+        "inicio_ms": 0,
+        "fin_ms": 20,
+        "cuerpo_sha256": "cuerpo",
+        "bitacora": [{
+            "sesion_id": "s1", "modelo": "modelo", "digest": "digest",
+            "n_tokens": 4799, "truncated": 0, "t_ms": 10,
+        }],
+    }
+    ok = paquete_contextual.aplicar_preflight(package, base, inst)
+    assert ok["preflight"]["aplicada"] is True
+    assert ok["correlacion"]["valida"] is True
+    sin_bitacora = dict(base, bitacora=[])
+    cerrado = paquete_contextual.aplicar_preflight(package, sin_bitacora, inst)
+    assert cerrado["preflight"]["aplicada"] is False
+    assert "truncated" not in sin_bitacora
+    viejo = dict(base, bitacora=[{
+        "sesion_id": "otra", "modelo": "modelo", "digest": "digest",
+        "n_tokens": 100, "truncated": 0, "t_ms": 10,
+    }])
+    assert paquete_contextual.aplicar_preflight(package, viejo, inst)["preflight"]["aplicada"] is False
+    discordante = dict(base, bitacora=[{
+        "sesion_id": "s1", "modelo": "modelo", "digest": "digest",
+        "n_tokens": 100, "truncated": 0, "t_ms": 10,
+    }])
+    assert paquete_contextual.aplicar_preflight(package, discordante, inst)["preflight"]["aplicada"] is False
+    tardio = dict(base, bitacora=[{**base["bitacora"][0], "t_ms": 500}])
+    assert paquete_contextual.aplicar_preflight(package, tardio, inst)["preflight"]["aplicada"] is False
+    otro_modelo = dict(base, bitacora=[{**base["bitacora"][0], "digest": "otro"}])
+    assert paquete_contextual.aplicar_preflight(package, otro_modelo, inst)["preflight"]["aplicada"] is False
+    marcado = dict(base, bitacora=[{**base["bitacora"][0], "truncated": 1}])
+    assert paquete_contextual.aplicar_preflight(package, marcado, inst)["preflight"]["aplicada"] is False
+    misma_etiqueta = dict(base, cuerpo_sha256="otra")
+    assert paquete_contextual.aplicar_preflight(package, misma_etiqueta, {"huella": "h", "cuerpo_sha256": "h"})["preflight"]["aplicada"] is False
+    assert paquete_contextual.truncados_en_log("") == []
 
 
 def test_el_preflight_real_no_conserva_el_texto(monkeypatch):
@@ -270,8 +291,10 @@ def test_el_preflight_real_no_conserva_el_texto(monkeypatch):
     assert "accept" not in json.dumps(trace)
 
 
-def test_la_vista_mide_el_mismo_paquete_y_no_juzga(tmp_path):
+def test_la_vista_mide_el_mismo_paquete_y_juzga_una_vez(tmp_path):
+    import hashlib
     import subprocess
+    import juez_contextual
     from video_editor import _ffmpeg_exe
 
     video = tmp_path / "fuente.mp4"
@@ -282,11 +305,38 @@ def test_la_vista_mide_el_mismo_paquete_y_no_juzga(tmp_path):
     )
     seen = {}
 
-    class Medidor:
-        def preflight(self, prompt, images):
+    class Transporte:
+        modelo = "modelo"
+        digest = "digest-fijo"
+
+        def preflight(self, prompt, images, cuerpo):
             seen["prompt"] = prompt
             seen["n"] = len(images)
-            return _trace(100, truncated=0, truncado_origen="log")
+            enviado = juez_contextual.cuerpo_preflight(cuerpo)
+            if getattr(self, "mutar", False):
+                enviado = dict(enviado)
+                enviado["messages"] = [{"role": "user", "content": "prompt cambiado", "images": images}]
+            raw = json.dumps(enviado, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            count = 80
+            return {
+                "raw": "",
+                "prompt_eval_count": count,
+                "eval_count": 1,
+                "done_reason": "length",
+                "error": None,
+                "num_ctx": 5120,
+                "num_predict_enviado": 1,
+                "sesion_id": "s1",
+                "modelo": self.modelo,
+                "digest": self.digest,
+                "inicio_ms": 0,
+                "fin_ms": 20,
+                "cuerpo_sha256": hashlib.sha256(raw).hexdigest(),
+                "bitacora": [{
+                    "sesion_id": "s1", "modelo": self.modelo, "digest": self.digest,
+                    "n_tokens": count, "truncated": 0, "t_ms": 10,
+                }],
+            }
 
         def complete(self, prompt, images):
             seen["juzgo"] = seen.get("juzgo", 0) + 1
@@ -295,7 +345,7 @@ def test_la_vista_mide_el_mismo_paquete_y_no_juzga(tmp_path):
                 "raw": json.dumps({"decision": "abstain", "motivo": "stub", "evidencias": []}),
                 "done_reason": "stop",
                 "error": None,
-                "prompt_eval_count": 100,
+                "prompt_eval_count": 80,
                 "eval_count": 12,
                 "num_ctx": 5120,
                 "num_predict": 220,
@@ -308,7 +358,8 @@ def test_la_vista_mide_el_mismo_paquete_y_no_juzga(tmp_path):
         CaptionCue("despues", 9.2, 9.5),
     ]
     moment = SimpleNamespace(start=0.5, cuts=[(0.5, 8.5)], source_words=words, segment=None, cues=[])
-    verdict = prueba_privada._contextual_view(moment, video, Medidor(), tmp_path / "frames", duracion_fuente=10.0)
+    cliente = Transporte()
+    verdict = prueba_privada._contextual_view(moment, video, cliente, tmp_path / "frames", duracion_fuente=10.0)
     assert seen["n"] == 3
     assert "entra" in seen["prompt"] and "despues" not in seen["prompt"]
     assert seen["juzgo"] == 1
@@ -316,8 +367,16 @@ def test_la_vista_mide_el_mismo_paquete_y_no_juzga(tmp_path):
     assert verdict["cliente"] == "juicio"
     assert verdict["decision"] == "abstain"
     assert verdict["llamadas_semanticas"] == 1
-    assert verdict["paquete"]["presupuesto"]["tokens_entrada"] == 100
-    assert verdict["paquete"]["truncado"] == 0
+    assert verdict["paquete"]["presupuesto"]["tokens_entrada"] == 80
+    assert verdict["paquete"]["correlacion"]["valida"] is True
+    assert verdict["cobertura_vista_por_el_modelo"]["contexto_completo"] is False
+    cambiado = dict(verdict["paquete"])
+    dentro = [dict(item) for item in cambiado["palabras"]["inside"]]
+    dentro[0] = dict(dentro[0], texto="CAMBIADA")
+    cambiado["palabras"] = dict(cambiado["palabras"], inside=dentro)
+    otra = prueba_privada._juzgar_una_vez(cambiado, Transporte(), juez_contextual)
+    assert otra["llamadas_semanticas"] == 0
+    assert "ya no es" in otra["motivo"]
     assert [item["reloj_fuente"] for item in verdict["paquete"]["fotogramas"]] == [0.5, 4.5, 8.45]
     assert all(item["sha256"] and item["materializado"] for item in verdict["paquete"]["fotogramas"])
 

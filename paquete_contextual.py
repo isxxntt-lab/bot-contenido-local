@@ -299,6 +299,24 @@ def construir_paquete(
         "missing": missing,
         "corte_fuera_de_fuente": fuera,
         "ass_es_asr_original": False,
+        "limites_cobertura": _limites(palabras_info),
+        "contexto_completo": False,
+        "tres_fotogramas_prueban_accion": False,
+    }
+
+
+def _limites(palabras: dict) -> dict:
+    def n(key):
+        value = palabras.get(key)
+        return None if value is None else len(value)
+    return {
+        "pre": n("pre"),
+        "dentro": palabras.get("inside_n"),
+        "post": n("post"),
+        "limite": n("limite"),
+        "silencio_quitado": n("silencio_quitado"),
+        "texto_en_la_peticion": "solo_palabras_dentro",
+        "contexto_completo": False,
     }
 
 
@@ -350,24 +368,92 @@ def huella_entrada(prompt: str, schema: dict, frame_shas: list[str], num_ctx: in
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def aplicar_preflight(package: dict, trace: dict, huella_paquete: str, huella_enviada: str) -> dict:
-    """Incorpora solo un conteo del backend. Una salida de texto no es una medición ni un juicio."""
+def correlacionar_truncado(respuesta: dict, bitacora) -> dict:
+    """Ata un renglón de bitácora a esta llamada. No convierte la ausencia en 0."""
+    vacio = {"valida": False, "truncated": None, "motivo": "no hay correlación con esta llamada"}
+    if not isinstance(respuesta, dict) or not isinstance(bitacora, list):
+        return vacio
+    count = respuesta.get("prompt_eval_count")
+    inicio, fin = respuesta.get("inicio_ms"), respuesta.get("fin_ms")
+    if not isinstance(count, int) or not isinstance(inicio, (int, float)) or not isinstance(fin, (int, float)):
+        return {**vacio, "motivo": "la respuesta no identifica el conteo ni la ventana de la llamada"}
+    if not respuesta.get("sesion_id") or not respuesta.get("modelo") or not respuesta.get("digest"):
+        return {**vacio, "motivo": "la respuesta no identifica sesión, modelo y digest"}
+    hits = []
+    for line in bitacora:
+        if not isinstance(line, dict) or not isinstance(line.get("truncated"), int):
+            continue
+        if line.get("sesion_id") != respuesta["sesion_id"]:
+            continue
+        if line.get("modelo") != respuesta["modelo"] or line.get("digest") != respuesta["digest"]:
+            continue
+        if line.get("n_tokens") != count:
+            continue
+        stamp = line.get("t_ms")
+        if not isinstance(stamp, (int, float)) or not (inicio <= stamp <= fin):
+            continue
+        hits.append(line)
+    if len(hits) != 1:
+        return {**vacio, "motivo": "la bitácora no ata un único renglón a esta llamada"}
+    flag = hits[0]["truncated"]
+    return {
+        "valida": flag == 0,
+        "truncated": flag,
+        "n_tokens": count,
+        "sesion_id": respuesta["sesion_id"],
+        "modelo": respuesta["modelo"],
+        "digest": respuesta["digest"],
+        "motivo": "correlación de esta llamada" if flag == 0 else f"truncated={flag}",
+    }
+
+
+def instantanea_entrada(
+    *,
+    prompt: str,
+    schema: dict,
+    imagenes: list[bytes],
+    modelo: str,
+    digest: str,
+    num_ctx: int,
+    fuente_sha: str | None,
+    mapa: dict,
+    palabras_dentro: list,
+) -> dict:
+    """Huella de lo que se enviaría. Se recalcula al medir y otra vez al juzgar."""
+    campos = {
+        "prompt": prompt,
+        "schema": schema,
+        "imagenes": [hashlib.sha256(blob).hexdigest() for blob in imagenes],
+        "modelo": modelo,
+        "digest": digest,
+        "num_ctx": num_ctx,
+        "margen_salida": NUM_PREDICT,
+        "fuente_sha256": fuente_sha,
+        "mapa": mapa,
+        "palabras_dentro": palabras_dentro,
+        "contexto_completo": False,
+        "tres_fotogramas_prueban_accion": False,
+    }
+    raw = json.dumps(campos, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {"campos": campos, "huella": hashlib.sha256(raw).hexdigest()}
+
+
+def aplicar_preflight(package: dict, trace: dict, instantanea_releida: dict) -> dict:
+    """La medición vale si el transporte y una relectura independiente coinciden, y la bitácora ata el truncado."""
     updated = dict(package)
     info = {
         "aplicada": False,
-        "huella_coincide": huella_paquete == huella_enviada,
         "contenido_descartado": not bool(trace.get("raw")),
         "num_predict_enviado": trace.get("num_predict_enviado"),
         "eval_count": trace.get("eval_count"),
         "done_reason": trace.get("done_reason"),
         "error": trace.get("error"),
-        "truncado": trace["truncated"] if isinstance(trace.get("truncated"), int) else None,
         "motivo": "",
     }
+    corr = correlacionar_truncado(trace, trace.get("bitacora"))
+    info["correlacion"] = corr
     if trace.get("raw"):
         info["motivo"] = "la salida no se descartó; no cuenta como medición ni como decisión"
-    elif not info["huella_coincide"]:
-        info["motivo"] = "la entrada medida no es la del paquete"
     elif trace.get("error"):
         info["motivo"] = str(trace["error"])
     elif trace.get("num_predict_enviado") != 1:
@@ -376,10 +462,12 @@ def aplicar_preflight(package: dict, trace: dict, huella_paquete: str, huella_en
         info["motivo"] = "el backend no devolvió prompt_eval_count"
     elif trace.get("num_ctx") != NUM_CTX:
         info["motivo"] = "la medición no usa el contexto congelado"
-    elif "truncated" not in trace or not isinstance(trace.get("truncated"), int):
-        info["motivo"] = "el servidor no informó truncated; la ausencia no se convierte en 0"
-    elif trace["truncated"] != 0:
-        info["motivo"] = f"el servidor informó truncated={trace['truncated']}"
+    elif not isinstance(instantanea_releida, dict) or not instantanea_releida.get("huella"):
+        info["motivo"] = "no hay relectura independiente de la entrada"
+    elif trace.get("cuerpo_sha256") != instantanea_releida.get("cuerpo_sha256"):
+        info["motivo"] = "el cuerpo que el transporte dice haber enviado no es el de la relectura"
+    elif not corr["valida"]:
+        info["motivo"] = corr["motivo"]
     else:
         updated["presupuesto"] = presupuesto({
             "origen": "backend",
@@ -387,10 +475,14 @@ def aplicar_preflight(package: dict, trace: dict, huella_paquete: str, huella_en
             "num_ctx": NUM_CTX,
             "num_predict": NUM_PREDICT,
         })
-        updated["truncado"] = 0
-        updated["truncado_origen"] = trace.get("truncado_origen")
-        info["aplicada"] = updated["presupuesto"]["estado"] == "medido"
-        info["motivo"] = updated["presupuesto"]["motivo"]
+        updated["correlacion"] = corr
+        updated["congelado"] = {
+            "huella": instantanea_releida["huella"],
+            "campos": instantanea_releida.get("campos"),
+            "cuerpo_sha256": instantanea_releida.get("cuerpo_sha256"),
+        }
+        info["aplicada"] = updated["presupuesto"]["estado"] == "medido" and updated["presupuesto"]["cabe"] is True
+        info["motivo"] = updated["presupuesto"]["motivo"] if info["aplicada"] else "la entrada medida no deja el margen de salida"
     updated["preflight"] = info
     updated["ensayo_hecho"] = False
     return updated
@@ -414,8 +506,11 @@ def motivo_de_bloqueo(package: dict) -> str:
     pres = package["presupuesto"]
     if pres["estado"] != "medido" or pres["cabe"] is not True:
         return "abstención: presupuesto de entrada no verificado"
-    if package.get("truncado") != 0:
-        return "abstención: no hay prueba explícita de que la entrada no se truncó"
+    corr = package.get("correlacion") or {}
+    if corr.get("valida") is not True or corr.get("truncated") != 0:
+        return "abstención: no hay correlación de no truncamiento con esta llamada"
+    if corr.get("n_tokens") != pres.get("tokens_entrada"):
+        return "abstención: el conteo de la bitácora no es el de la respuesta"
     return ""
 
 
@@ -473,7 +568,11 @@ def paquete_de_momento(moment, fuente: Path | None = None, duracion_fuente: floa
     )
     start = getattr(moment, "start", None)
     if start is not None and cuts and abs(float(start) - cuts[0][0]) > 0.02:
-        package["desajuste_inicio"] = {"inicio_momento": round(float(start), 3), "primer_corte": round(cuts[0][0], 3)}
+        package["desajuste_inicio"] = {
+            "inicio_momento": round(float(start), 3),
+            "primer_corte": round(cuts[0][0], 3),
+            "bloquea": False,
+        }
     return package
 
 

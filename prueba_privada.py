@@ -13,6 +13,7 @@ términos bloqueados y el contenido de terceros no se procesan.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import re
@@ -42,7 +43,14 @@ def require_judge() -> None:
         raise RuntimeError("clip_judge.judge no está disponible; no se genera nada")
 
 
-_CODE_FILES = ("prueba_privada.py", "clip_judge.py", "narrative_segments.py", "clipazos.py")
+_CODE_FILES = (
+    "prueba_privada.py",
+    "clip_judge.py",
+    "narrative_segments.py",
+    "clipazos.py",
+    "juez_contextual.py",
+    "paquete_contextual.py",
+)
 _PRIVATE_NAME = (".env", "credencial", "token", "secret", "client_secret")
 
 
@@ -571,45 +579,83 @@ def materializar_receta(video: Path, cuts, folder: Path) -> list[dict] | None:
     return written
 
 
-def _medir_paquete(package: dict, client, schema: dict) -> dict:
-    """Preflight de la entrada congelada. No llama a complete ni lee una decisión."""
+def _leer_entrada(package: dict, schema: dict, modelo: str, digest: str):
+    """Relee palabras, fotogramas y cuerpo. None si el disco ya no coincide."""
     import juez_contextual
     import paquete_contextual
 
     coverage = paquete_contextual.cobertura_entrada(package)
     frames = package.get("fotogramas") or []
-    if coverage is None or any(not item.get("sha256") or not item.get("materializado") for item in frames):
+    if coverage is None or any(not item.get("materializado") for item in frames):
+        return None
+    imagenes = []
+    for item in frames:
+        path = Path(item["archivo"])
+        if not path.is_file():
+            return None
+        blob = path.read_bytes()
+        if paquete_contextual.sha256_file(path) != hashlib.sha256(blob).hexdigest():
+            return None
+        if item.get("sha256") and item["sha256"] != hashlib.sha256(blob).hexdigest():
+            return None
+        imagenes.append(blob)
+    prompt = juez_contextual.prompt_for(coverage)
+    fuente = ((package.get("identidad") or {}).get("fuente") or {}).get("sha256")
+    instantanea = paquete_contextual.instantanea_entrada(
+        prompt=prompt,
+        schema=schema,
+        imagenes=imagenes,
+        modelo=modelo,
+        digest=digest,
+        num_ctx=paquete_contextual.NUM_CTX,
+        fuente_sha=fuente,
+        mapa=package.get("mapa"),
+        palabras_dentro=coverage["palabras"],
+    )
+    cuerpo = juez_contextual.build_request(modelo, prompt, [base64.b64encode(blob).decode("ascii") for blob in imagenes], paquete_contextual.NUM_CTX, 0)
+    cuerpo_bytes = json.dumps(cuerpo, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    instantanea["cuerpo_sha256"] = hashlib.sha256(cuerpo_bytes).hexdigest()
+    instantanea["cuerpo"] = cuerpo
+    instantanea["prompt"] = prompt
+    instantanea["imagenes"] = imagenes
+    return instantanea
+
+
+def _medir_paquete(package: dict, client, schema: dict) -> dict:
+    """Preflight. La huella se relee después; no se compara una copia consigo misma."""
+    import juez_contextual
+    import paquete_contextual
+
+    modelo = getattr(client, "modelo", None) or getattr(client, "model", None)
+    digest = getattr(client, "digest", None)
+    if not modelo or not digest:
+        package = dict(package)
+        package["preflight"] = {"aplicada": False, "motivo": "el cliente no identifica modelo y digest"}
+        return package
+    antes = _leer_entrada(package, schema, modelo, digest)
+    if antes is None:
         package = dict(package)
         package["preflight"] = {"aplicada": False, "motivo": "faltan palabras de dentro o fotogramas hasheados"}
         return package
-    paths = []
-    shas = []
-    for item in frames:
-        path = Path(item["archivo"])
-        digest = paquete_contextual.sha256_file(path)
-        if digest != item["sha256"]:
-            package = dict(package)
-            package["preflight"] = {"aplicada": False, "motivo": "el fotograma en disco no coincide con el hash del paquete"}
-            return package
-        paths.append(path)
-        shas.append(digest)
-    prompt = juez_contextual.prompt_for(coverage)
-    huella = paquete_contextual.huella_entrada(prompt, schema, shas, paquete_contextual.NUM_CTX)
-    images = [juez_contextual._image_b64(path) for path in paths]
-    trace = client.preflight(prompt, images)
-    updated = paquete_contextual.aplicar_preflight(package, trace, huella, huella)
-    updated["congelado"] = {
-        "receta": paquete_contextual.RECIPE_ID,
-        "schema_sha256": hashlib.sha256(
-            json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest(),
-        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-        "entrada_sha256": huella,
-        "frames": shas,
-        "num_ctx": paquete_contextual.NUM_CTX,
-        "margen_salida": paquete_contextual.NUM_PREDICT,
-    }
-    return updated
+    images = [base64.b64encode(blob).decode("ascii") for blob in antes["imagenes"]]
+    enviado = juez_contextual.cuerpo_preflight(antes["cuerpo"])
+    esperado = hashlib.sha256(
+        json.dumps(enviado, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    trace = client.preflight(antes["prompt"], images, antes["cuerpo"])
+    if not isinstance(trace, dict):
+        trace = {}
+    despues = _leer_entrada(package, schema, modelo, digest)
+    if despues is None or despues["huella"] != antes["huella"]:
+        package = dict(package)
+        package["preflight"] = {"aplicada": False, "motivo": "la entrada cambió durante la medición"}
+        return package
+    despues["cuerpo_sha256"] = esperado
+    if trace.get("cuerpo_sha256") != esperado:
+        package = dict(package)
+        package["preflight"] = {"aplicada": False, "motivo": "el transporte no envió el cuerpo construido"}
+        return package
+    return paquete_contextual.aplicar_preflight(package, trace, despues)
 
 
 def capturar_evidencia(video: Path, folder: Path, config: dict) -> dict:
@@ -695,16 +741,26 @@ def _contextual_view(moment, video: Path, client, folder: Path, medicion=None, d
 
 
 def _juzgar_una_vez(package: dict, client, juez_contextual) -> dict:
-    """Una llamada con la entrada ya medida. No reintenta ni cambia el prompt."""
+    """Una llamada si la relectura sigue igual que la medición. No reintenta."""
     import paquete_contextual
 
-    coverage = paquete_contextual.cobertura_entrada(package)
-    frames = package.get("fotogramas") or []
-    paths = [Path(item["archivo"]) for item in frames]
-    prompt = juez_contextual.prompt_for(coverage)
-    images = [juez_contextual._image_b64(path) for path in paths]
+    modelo = getattr(client, "modelo", None) or getattr(client, "model", None)
+    digest = getattr(client, "digest", None)
+    releida = _leer_entrada(package, juez_contextual.OUTPUT_SCHEMA, modelo or "", digest or "")
+    congelado = (package.get("congelado") or {}).get("huella")
+    if releida is None or not congelado or releida["huella"] != congelado:
+        return {
+            "decision": "abstain",
+            "motivo": "la entrada ya no es la que se midió",
+            "valido": False,
+            "evidencias": [],
+            "paquete": package,
+            "llamadas_semanticas": 0,
+            "cliente": "no_llamado",
+        }
+    images = [base64.b64encode(blob).decode("ascii") for blob in releida["imagenes"]]
     try:
-        trace = client.complete(prompt, images)
+        trace = client.complete(releida["prompt"], images)
     except Exception as exc:  # noqa: BLE001
         return {
             "decision": "abstain",
@@ -716,6 +772,7 @@ def _juzgar_una_vez(package: dict, client, juez_contextual) -> dict:
         }
     if not isinstance(trace, dict):
         trace = {"raw": str(trace), "error": None}
+    coverage = paquete_contextual.cobertura_entrada(package)
     if trace.get("error") or not trace.get("raw"):
         verdict = {
             "decision": "abstain",
@@ -732,9 +789,15 @@ def _juzgar_una_vez(package: dict, client, juez_contextual) -> dict:
     }
     verdict["paquete"] = package
     verdict["llamadas_semanticas"] = 1
+    dentro = len(coverage["palabras"]) if coverage else 0
+    limites = package.get("limites_cobertura") or {}
     verdict["cobertura_vista_por_el_modelo"] = {
-        "dentro": len(coverage["palabras"]) if coverage else 0,
+        "dentro": dentro,
+        "pre": limites.get("pre"),
+        "post": limites.get("post"),
         "fuera_no_enviado": True,
+        "contexto_completo": False,
+        "tres_fotogramas_prueban_accion": False,
     }
     return verdict
 

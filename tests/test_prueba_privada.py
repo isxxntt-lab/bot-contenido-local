@@ -261,18 +261,20 @@ def _git_repo(path: Path) -> None:
 
 def test_sin_repo_la_procedencia_no_dice_limpio(tmp_path, monkeypatch):
     monkeypatch.setattr(clipazos, "BASE_DIR", tmp_path)
-    for name in ("prueba_privada.py", "clip_judge.py", "narrative_segments.py", "clipazos.py"):
+    for name in ("prueba_privada.py", "clip_judge.py", "narrative_segments.py", "clipazos.py", "juez_contextual.py", "paquete_contextual.py"):
         (tmp_path / name).write_bytes(b"codigo")
     report = prueba_privada.code_provenance()
     assert report["git_estado"] == "desconocido"
     assert report["dirty"] is None
     assert report["motivo"]
+    assert "juez_contextual.py" in report["sha256"]
+    assert "paquete_contextual.py" in report["sha256"]
     assert report["runner_en_commit"] is None
     assert len(report["sha256"]["clip_judge.py"]) == 64
 
 
 def test_procedencia_separa_limpio_untracked_y_tracked(tmp_path, monkeypatch):
-    for name in ("prueba_privada.py", "clip_judge.py", "narrative_segments.py", "clipazos.py"):
+    for name in ("prueba_privada.py", "clip_judge.py", "narrative_segments.py", "clipazos.py", "juez_contextual.py", "paquete_contextual.py"):
         (tmp_path / name).write_text("version\n", encoding="utf-8")
     _git_repo(tmp_path)
     subprocess.run(["git", "add", "--", "."], cwd=tmp_path, check=True, capture_output=True)
