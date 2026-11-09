@@ -185,15 +185,54 @@ def _image_b64(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("ascii")
 
 
+class ObservadorLog:
+    """Solo el texto añadido al log del servidor propio después de marcar la llamada."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+
+    def marca(self) -> int:
+        return self.path.stat().st_size if self.path.is_file() else 0
+
+    def texto_desde(self, marca: int) -> str:
+        if not self.path.is_file():
+            return ""
+        data = self.path.read_bytes()
+        if not isinstance(marca, int) or marca < 0 or marca > len(data):
+            return ""
+        return data[marca:].decode("utf-8", "replace")
+
+
 class OllamaVision:
     """Cliente local. Un fallo de red, tiempo o memoria es abstención."""
 
-    def __init__(self, base_url: str, model: str, timeout: float = 90.0, num_ctx: int = 5120, keep_alive: int | str = 0) -> None:
+    def __init__(self, base_url: str, model: str, timeout: float = 90.0, num_ctx: int = 5120, keep_alive: int | str = 0, observador: ObservadorLog | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.modelo = model
+        self.digest = None
         self.timeout = timeout
         self.num_ctx = num_ctx
         self.keep_alive = keep_alive
+        self.observador = observador
+
+    def identificar(self) -> dict:
+        """Digest que publica /api/tags del runtime instalado. No es una inferencia."""
+        request = urllib.request.Request(self.base_url + "/api/tags")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+            return {"ok": False, "motivo": f"el runtime no listó modelos: {exc}"}
+        models = payload.get("models") if isinstance(payload, dict) else None
+        if not isinstance(models, list):
+            return {"ok": False, "motivo": "el runtime no devolvió la lista de modelos"}
+        chosen = next((item for item in models if isinstance(item, dict) and item.get("name") == self.model), None)
+        digest = chosen.get("digest") if isinstance(chosen, dict) else None
+        if not isinstance(digest, str) or not digest:
+            return {"ok": False, "motivo": "el runtime no devolvió digest para este modelo"}
+        self.digest = digest
+        return {"ok": True, "modelo": self.model, "digest": digest, "fuente": "/api/tags"}
 
     def complete(self, prompt: str, images: list[str]) -> dict:
         body = build_request(self.model, prompt, images, self.num_ctx, self.keep_alive)
@@ -210,6 +249,7 @@ class OllamaVision:
             "n_images": len(images),
             "prompt_chars": len(prompt),
         }
+        marca = self.observador.marca() if self.observador is not None else None
         request = urllib.request.Request(
             self.base_url + "/api/chat",
             data=json.dumps(body).encode("utf-8"),
@@ -232,6 +272,9 @@ class OllamaVision:
         trace["done_reason"] = payload.get("done_reason")
         trace["prompt_eval_count"] = payload.get("prompt_eval_count")
         trace["eval_count"] = payload.get("eval_count")
+        trace["modelo"] = self.model
+        trace["digest"] = self.digest
+        trace["log_nuevo"] = self.observador.texto_desde(marca) if self.observador is not None and marca is not None else ""
         if payload.get("load_duration") is not None:
             trace["load_duration_ms"] = round(payload["load_duration"] / 1e6, 1)
         if payload.get("total_duration") is not None:
@@ -264,6 +307,7 @@ class OllamaVision:
             trace["error"] = "la petición de preflight no conserva la entrada del juicio"
             trace["done_reason"] = "entrada_distinta"
             return trace
+        marca = self.observador.marca() if self.observador is not None else None
         request = urllib.request.Request(
             self.base_url + "/api/chat",
             data=json.dumps(enviado).encode("utf-8"),
@@ -284,14 +328,16 @@ class OllamaVision:
         trace["done_reason"] = payload.get("done_reason")
         trace["prompt_eval_count"] = payload.get("prompt_eval_count")
         trace["eval_count"] = payload.get("eval_count")
-        trace["bitacora"] = []
+        trace["modelo"] = self.model
+        trace["digest"] = self.digest
+        trace["log_nuevo"] = self.observador.texto_desde(marca) if self.observador is not None and marca is not None else ""
         trace["cuerpo_sha256"] = hashlib.sha256(
             json.dumps(enviado, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
         trace["correlacion"] = {
             "valida": False,
             "truncated": None,
-            "motivo": "la API no devuelve truncated y esta sesión no tiene bitácora ligada",
+            "motivo": "sin digest observado o sin log nuevo; la API no trae truncated",
         }
         if payload.get("load_duration") is not None:
             trace["load_duration_ms"] = round(payload["load_duration"] / 1e6, 1)

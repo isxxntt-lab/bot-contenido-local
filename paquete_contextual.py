@@ -368,42 +368,30 @@ def huella_entrada(prompt: str, schema: dict, frame_shas: list[str], num_ctx: in
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def correlacionar_truncado(respuesta: dict, bitacora) -> dict:
-    """Ata un renglón de bitácora a esta llamada. No convierte la ausencia en 0."""
-    vacio = {"valida": False, "truncated": None, "motivo": "no hay correlación con esta llamada"}
-    if not isinstance(respuesta, dict) or not isinstance(bitacora, list):
+def correlacionar_observacion(respuesta: dict) -> dict:
+    """Lee el log nuevo de esta llamada. Un entero suelto no cuenta y la ausencia no es 0."""
+    vacio = {"valida": False, "truncated": None, "motivo": "no hay observación de esta llamada"}
+    if not isinstance(respuesta, dict):
         return vacio
     count = respuesta.get("prompt_eval_count")
-    inicio, fin = respuesta.get("inicio_ms"), respuesta.get("fin_ms")
-    if not isinstance(count, int) or not isinstance(inicio, (int, float)) or not isinstance(fin, (int, float)):
-        return {**vacio, "motivo": "la respuesta no identifica el conteo ni la ventana de la llamada"}
-    if not respuesta.get("sesion_id") or not respuesta.get("modelo") or not respuesta.get("digest"):
-        return {**vacio, "motivo": "la respuesta no identifica sesión, modelo y digest"}
-    hits = []
-    for line in bitacora:
-        if not isinstance(line, dict) or not isinstance(line.get("truncated"), int):
-            continue
-        if line.get("sesion_id") != respuesta["sesion_id"]:
-            continue
-        if line.get("modelo") != respuesta["modelo"] or line.get("digest") != respuesta["digest"]:
-            continue
-        if line.get("n_tokens") != count:
-            continue
-        stamp = line.get("t_ms")
-        if not isinstance(stamp, (int, float)) or not (inicio <= stamp <= fin):
-            continue
-        hits.append(line)
-    if len(hits) != 1:
-        return {**vacio, "motivo": "la bitácora no ata un único renglón a esta llamada"}
-    flag = hits[0]["truncated"]
+    if not isinstance(count, int):
+        return {**vacio, "motivo": "la respuesta no trae prompt_eval_count"}
+    if not respuesta.get("modelo") or not respuesta.get("digest"):
+        return {**vacio, "motivo": "no hay modelo o digest observado en el runtime"}
+    texto = respuesta.get("log_nuevo")
+    if not isinstance(texto, str) or not texto.strip():
+        return {**vacio, "motivo": "no hay log nuevo de esta llamada"}
+    coinciden = [item for item in truncados_en_log(texto) if item["n_tokens"] == count]
+    if len(coinciden) != 1:
+        return {**vacio, "motivo": "el log nuevo no ata un único renglón a este conteo"}
+    flag = coinciden[0]["truncated"]
     return {
         "valida": flag == 0,
         "truncated": flag,
         "n_tokens": count,
-        "sesion_id": respuesta["sesion_id"],
         "modelo": respuesta["modelo"],
         "digest": respuesta["digest"],
-        "motivo": "correlación de esta llamada" if flag == 0 else f"truncated={flag}",
+        "motivo": "log nuevo de esta llamada" if flag == 0 else f"truncated={flag}",
     }
 
 
@@ -433,6 +421,7 @@ def instantanea_entrada(
         "palabras_dentro": palabras_dentro,
         "contexto_completo": False,
         "tres_fotogramas_prueban_accion": False,
+        "render_en_la_decision": False,
     }
     raw = json.dumps(campos, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return {"campos": campos, "huella": hashlib.sha256(raw).hexdigest()}
@@ -450,7 +439,7 @@ def aplicar_preflight(package: dict, trace: dict, instantanea_releida: dict) -> 
         "error": trace.get("error"),
         "motivo": "",
     }
-    corr = correlacionar_truncado(trace, trace.get("bitacora"))
+    corr = correlacionar_observacion(trace)
     info["correlacion"] = corr
     if trace.get("raw"):
         info["motivo"] = "la salida no se descartó; no cuenta como medición ni como decisión"

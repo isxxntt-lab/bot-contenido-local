@@ -232,34 +232,28 @@ def test_el_preflight_se_cierra_sin_correlacion_de_esta_llamada():
         "inicio_ms": 0,
         "fin_ms": 20,
         "cuerpo_sha256": "cuerpo",
-        "bitacora": [{
-            "sesion_id": "s1", "modelo": "modelo", "digest": "digest",
-            "n_tokens": 4799, "truncated": 0, "t_ms": 10,
-        }],
+        "modelo": "modelo",
+        "digest": "digest",
+        "log_nuevo": "stop processing: n_tokens = 4799, truncated = 0\n",
     }
     ok = paquete_contextual.aplicar_preflight(package, base, inst)
     assert ok["preflight"]["aplicada"] is True
     assert ok["correlacion"]["valida"] is True
-    sin_bitacora = dict(base, bitacora=[])
-    cerrado = paquete_contextual.aplicar_preflight(package, sin_bitacora, inst)
+    assert ok["correlacion"]["truncated"] == 0
+    sin_log = dict(base, log_nuevo="")
+    cerrado = paquete_contextual.aplicar_preflight(package, sin_log, inst)
     assert cerrado["preflight"]["aplicada"] is False
-    assert "truncated" not in sin_bitacora
-    viejo = dict(base, bitacora=[{
-        "sesion_id": "otra", "modelo": "modelo", "digest": "digest",
-        "n_tokens": 100, "truncated": 0, "t_ms": 10,
-    }])
+    assert "truncated" not in sin_log
+    suelto = dict(base, log_nuevo="", truncated=0)
+    assert paquete_contextual.aplicar_preflight(package, suelto, inst)["preflight"]["aplicada"] is False
+    viejo = dict(base, log_nuevo="stop processing: n_tokens = 100, truncated = 0\n")
     assert paquete_contextual.aplicar_preflight(package, viejo, inst)["preflight"]["aplicada"] is False
-    discordante = dict(base, bitacora=[{
-        "sesion_id": "s1", "modelo": "modelo", "digest": "digest",
-        "n_tokens": 100, "truncated": 0, "t_ms": 10,
-    }])
-    assert paquete_contextual.aplicar_preflight(package, discordante, inst)["preflight"]["aplicada"] is False
-    tardio = dict(base, bitacora=[{**base["bitacora"][0], "t_ms": 500}])
-    assert paquete_contextual.aplicar_preflight(package, tardio, inst)["preflight"]["aplicada"] is False
-    otro_modelo = dict(base, bitacora=[{**base["bitacora"][0], "digest": "otro"}])
-    assert paquete_contextual.aplicar_preflight(package, otro_modelo, inst)["preflight"]["aplicada"] is False
-    marcado = dict(base, bitacora=[{**base["bitacora"][0], "truncated": 1}])
+    doble = dict(base, log_nuevo=base["log_nuevo"] + base["log_nuevo"])
+    assert paquete_contextual.aplicar_preflight(package, doble, inst)["preflight"]["aplicada"] is False
+    marcado = dict(base, log_nuevo="stop processing: n_tokens = 4799, truncated = 1\n")
     assert paquete_contextual.aplicar_preflight(package, marcado, inst)["preflight"]["aplicada"] is False
+    sin_digest = dict(base, digest=None)
+    assert paquete_contextual.aplicar_preflight(package, sin_digest, inst)["preflight"]["aplicada"] is False
     misma_etiqueta = dict(base, cuerpo_sha256="otra")
     assert paquete_contextual.aplicar_preflight(package, misma_etiqueta, {"huella": "h", "cuerpo_sha256": "h"})["preflight"]["aplicada"] is False
     assert paquete_contextual.truncados_en_log("") == []
@@ -288,7 +282,56 @@ def test_el_preflight_real_no_conserva_el_texto(monkeypatch):
     assert trace["raw"] == ""
     assert trace["prompt_eval_count"] == 80
     assert trace["contenido_descartado"] is True
-    assert "accept" not in json.dumps(trace)
+    assert "accept" not in json.dumps({k: v for k, v in trace.items() if k != "log_nuevo"})
+    assert "truncated" not in trace
+    assert trace["log_nuevo"] == ""
+
+
+def test_el_cliente_real_solo_cambia_el_tope_y_lee_el_log_nuevo(tmp_path, monkeypatch):
+    import juez_contextual
+    log = tmp_path / "server.log"
+    log.write_text("stop processing: n_tokens = 1, truncated = 0\n", encoding="utf-8")
+    obs = juez_contextual.ObservadorLog(log)
+    enviados = []
+
+    class Respuesta:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write("stop processing: n_tokens = 3, truncated = 0\n")
+            return json.dumps({
+                "message": {"content": '{"decision":"abstain","motivo":"x","evidencias":[]}'},
+                "done_reason": "stop",
+                "prompt_eval_count": 3,
+                "eval_count": 1,
+            }).encode()
+
+    def urlopen(request, timeout=0):
+        enviados.append(json.loads(request.data.decode("utf-8")))
+        return Respuesta()
+
+    monkeypatch.setattr(juez_contextual.urllib.request, "urlopen", urlopen)
+    client = juez_contextual.OllamaVision("http://127.0.0.1:9", "qwen3-vl:4b-instruct", observador=obs)
+    client.digest = "digest-observado"
+    pre = client.preflight("hola", ["aaaa"])
+    comp = client.complete("hola", ["aaaa"])
+    assert enviados[0]["options"]["num_predict"] == 1
+    assert enviados[1]["options"]["num_predict"] == 220
+    izquierda, derecha = dict(enviados[0]), dict(enviados[1])
+    izquierda["options"] = dict(izquierda["options"])
+    derecha["options"] = dict(derecha["options"])
+    izquierda["options"]["num_predict"] = None
+    derecha["options"]["num_predict"] = None
+    assert izquierda == derecha
+    assert "n_tokens = 1" not in pre["log_nuevo"]
+    corr = paquete_contextual.correlacionar_observacion(pre)
+    assert corr["valida"] is True and corr["n_tokens"] == 3
+    assert paquete_contextual.correlacionar_observacion(comp)["valida"] is True
 
 
 def test_la_vista_mide_el_mismo_paquete_y_juzga_una_vez(tmp_path):
@@ -326,16 +369,10 @@ def test_la_vista_mide_el_mismo_paquete_y_juzga_una_vez(tmp_path):
                 "error": None,
                 "num_ctx": 5120,
                 "num_predict_enviado": 1,
-                "sesion_id": "s1",
                 "modelo": self.modelo,
                 "digest": self.digest,
-                "inicio_ms": 0,
-                "fin_ms": 20,
+                "log_nuevo": f"stop processing: n_tokens = {count}, truncated = 0\n",
                 "cuerpo_sha256": hashlib.sha256(raw).hexdigest(),
-                "bitacora": [{
-                    "sesion_id": "s1", "modelo": self.modelo, "digest": self.digest,
-                    "n_tokens": count, "truncated": 0, "t_ms": 10,
-                }],
             }
 
         def complete(self, prompt, images):
@@ -349,6 +386,9 @@ def test_la_vista_mide_el_mismo_paquete_y_juzga_una_vez(tmp_path):
                 "eval_count": 12,
                 "num_ctx": 5120,
                 "num_predict": 220,
+                "modelo": self.modelo,
+                "digest": self.digest,
+                "log_nuevo": "stop processing: n_tokens = 80, truncated = 0\n",
             }
 
     words = [
