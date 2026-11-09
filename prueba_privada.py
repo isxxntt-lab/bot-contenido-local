@@ -42,6 +42,34 @@ def require_judge() -> None:
         raise RuntimeError("clip_judge.judge no está disponible; no se genera nada")
 
 
+def code_provenance() -> dict:
+    """Commit, árbol sucio y hash de los archivos que deciden el ensayo.
+
+    No afirma que un commit antiguo ya contuviera este runner.
+    """
+    files = ("prueba_privada.py", "clip_judge.py", "narrative_segments.py", "clipazos.py")
+    digests = {}
+    for name in files:
+        path = clipazos.BASE_DIR / name
+        digest = hashlib.sha256()
+        digest.update(path.read_bytes())
+        digests[name] = digest.hexdigest()
+    head, dirty = "", True
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=clipazos.BASE_DIR,
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        porcelain = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=clipazos.BASE_DIR, capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        dirty = bool(porcelain)
+    except OSError:
+        head = ""
+    return {"git": head, "dirty": dirty, "sha256": digests}
+
+
 def judge_version(config: dict) -> dict:
     settings = clip_judge.settings_from(config)
     selection = narrative_segments.settings_from(config)
@@ -284,6 +312,7 @@ def _write_md(path: Path, record: dict) -> None:
         f"- Juez {judge.get('version', {}).get('modulo')} ({judge.get('version', {}).get('git', '')}): "
         f"ejecutado={judge.get('ejecutado')} puntuación={judge.get('puntuacion')} aceptado={judge.get('aceptado')}",
         f"- Motivos del juez: {'; '.join(judge.get('motivos') or []) or '—'}",
+        f"- Abstenciones: {'; '.join(judge.get('abstenciones') or []) or '—'}",
         f"- Avisos no bloqueantes: {'; '.join(judge.get('avisos') or []) or '—'}",
         f"- Rechazado por: {', '.join(record.get('rechazado_por') or []) or '—'}",
         f"- QA: {record.get('qa')}",
@@ -344,6 +373,7 @@ def evaluate_candidate(candidate, config: dict, folder: Path, cache_dir: Path) -
             narrative_segments.settings_from(config)["segundos_max"],
             config.get("idioma", "es"),
             config,
+            cache_dir=cache_dir,
         )
     except Exception as exc:  # noqa: BLE001 - un clip roto no publica nada; se apunta y se sigue
         record["rechazado_por"] = ["error_tecnico"]
@@ -358,6 +388,8 @@ def evaluate_candidate(candidate, config: dict, folder: Path, cache_dir: Path) -
         "puntuacion": judgement.get("puntuacion"),
         "motivos": judgement.get("motivos") or [],
         "avisos": judgement.get("avisos") or [],
+        "abstenciones": judgement.get("abstenciones") or [],
+        "decision": judgement.get("decision"),
         "criterios": judgement.get("criterios") or {},
     }
     record["arco"] = _arco(moment)
@@ -369,7 +401,7 @@ def evaluate_candidate(candidate, config: dict, folder: Path, cache_dir: Path) -
     }
     record["layout"] = moment.layout.kind if moment.layout else None
     if not judgement.get("aceptado"):
-        record["rechazado_por"] = ["juez"]
+        record["rechazado_por"] = ["abstencion" if judgement.get("decision") == "abstencion" else "juez"]
         _finish(folder, record)
         return record
     try:
@@ -455,8 +487,12 @@ def run(
         "publication_eligible": False,
         "evaluados": 0,
         "exportados": 0,
-        "rechazados": {"derechos_restringidos": 0, "despedida_rutinaria": 0, "juez": 0, "qa": 0, "error_tecnico": 0},
+        "rechazados": {
+            "derechos_restringidos": 0, "despedida_rutinaria": 0, "juez": 0,
+            "abstencion": 0, "qa": 0, "error_tecnico": 0,
+        },
         "juez": judge_version(config),
+        "procedencia": code_provenance(),
         "clips": [],
     }
     run_desktop = None

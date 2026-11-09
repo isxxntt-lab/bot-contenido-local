@@ -96,22 +96,77 @@ def test_por_con_puntuacion_de_asr_se_rechaza():
         verdict = clip_judge.judge(words, segment, config=PROD)
         assert not verdict.accepted, (last, verdict.reasons, segment.to_dict())
         assert any(item.startswith("cierre_colgante:") for item in verdict.reasons), (last, verdict.reasons)
-        assert verdict.criteria["final_completo"]["ok"] is True
+        if last != "por":
+            assert verdict.criteria["final_completo"]["ok"] is True, last
         assert "cierre_colgante" not in PROD["seleccion"]["juez"]["obligatorios"]
 
 
-def test_pario_y_dialogo_con_dos_unidades_siguen_aceptados():
+def test_pario_en_la_misma_unidad_sigue_aceptado():
+    """Diálogo de varias frases con pausa corta: una unidad, cierre de verdad."""
     words = build([
         ("Vale hoy el jefe final tiene la barra casi vacía.", 0.0),
-        ("Salto esquivo el primer ataque y preparo el golpe.", 0.3),
-        ("NOOO", 2.0),
+        ("Salto esquivo el primer ataque y preparo el golpe.", 0.4),
+        ("NOOO", 0.4),
         ("La puta que te parió!", 0.2),
     ])
     peak = word_at(words, "NOOO").start
     segment = ns.segment_for_peak(words, peak, ns.settings_from(PROD), total=words[-1].end + 2)
     verdict = clip_judge.judge(words, segment, length=segment.length, config=PROD)
+    assert segment.crosses_units is False, segment.to_dict()
     assert verdict.criteria["cierre_colgante"]["ok"] is True
+    assert verdict.decision == "aceptado", (verdict.reasons, verdict.abstentions, segment.to_dict())
+    assert verdict.accepted
+
+
+def test_frase_larga_en_por_y_otra_despues_no_se_acepta():
+    larga = (
+        "Vale chat mirad lo que me ha pasado hoy en la partida final del jefe "
+        "porque salió por detrás y casi me deja sin ninguna vida en el intento "
+        "y al final me suelta ostias por"
+    )
+    words = build([
+        (larga, 0.0),
+        ("Después el chat empieza a reírse de toda la jugada.", 2.0),
+    ])
+    peak = words[8].start
+    segment = ns.segment_for_peak(words, peak, ns.settings_from(PROD), total=words[-1].end + 2)
+    verdict = clip_judge.judge(words, segment, length=segment.length, config=PROD)
+    assert words[segment.last_word].text == "por", (words[segment.last_word].text, segment.to_dict())
+    assert segment.complete_end is True
+    assert not verdict.accepted
+    assert any(item.startswith("cierre_colgante:") for item in verdict.reasons)
+
+
+def test_dos_unidades_unidas_para_durar_se_abstiene():
+    words = build([
+        ("Bueno vamos a empezar esta partida con mucha calma y sin ninguna prisa en el directo de hoy.", 0.0),
+        ("Cada uno saca su celular y espera con calma el siguiente aviso antes de seguir jugando.", 2.0),
+    ])
+    peak = words[3].start
+    segment = ns.segment_for_peak(words, peak, ns.settings_from(PROD), total=words[-1].end + 2)
+    verdict = clip_judge.judge(words, segment, length=segment.length, config=PROD)
     assert segment.crosses_units is True, segment.to_dict()
-    assert any("mezcla dos intervenciones" in item for item in verdict.warnings)
-    assert not any(item.startswith("cierre_colgante:") for item in verdict.reasons)
-    assert verdict.accepted, (verdict.reasons, verdict.warnings, segment.to_dict())
+    assert segment.length >= 10
+    assert verdict.decision == "abstencion", (verdict.reasons, verdict.abstentions, segment.to_dict())
+    assert not verdict.accepted
+    assert verdict.score >= 0.6
+
+
+def test_cola_de_silencio_no_cierra_ostias_por():
+    words = build([("vaya ostias por", 0.0)])
+    short = ns.split_sentences(words, 0.6, total=words[-1].end + 0.05)
+    long = ns.split_sentences(words, 0.6, total=words[-1].end + 0.40)
+    assert short[-1].closed is False and long[-1].closed is False
+
+
+def test_intro_con_el_pico_al_principio_no_tiene_remate():
+    words = build([(
+        "Bueno vamos a hacerlo muy sencillo muy fácil y cada uno saca su celular ahora mismo para seguir.",
+        0.0,
+    )])
+    peak = words[0].start
+    segment = ns.segment_for_peak(words, peak, ns.settings_from(PROD), total=words[-1].end + 2)
+    verdict = clip_judge.judge(words, segment, length=segment.length, config=PROD)
+    assert not verdict.criteria["remate"]["ok"]
+    assert not verdict.accepted
+    assert any(item.startswith("remate:") for item in verdict.reasons)

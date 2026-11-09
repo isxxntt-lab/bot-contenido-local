@@ -550,12 +550,15 @@ def clean_cache(days: int = CACHE_DAYS, keep_videos: int = 0) -> None:
                 path.unlink(missing_ok=True)
 
 
-def fetch_media(candidate: Candidate) -> Path:
-    """Localiza el clip con yt-dlp y FFmpeg baja solo el tramo que hace falta."""
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    destination = CACHE_DIR / f"{_safe_name(candidate.key)}.mp4"
+def fetch_media(candidate: Candidate, cache_dir: Path | None = None) -> Path:
+    """Localiza el clip. Sin ``cache_dir`` descarga si falta; con él no sale de esa carpeta."""
+    directory = cache_dir if cache_dir is not None else CACHE_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / f"{_safe_name(candidate.key)}.mp4"
     if destination.is_file() and destination.stat().st_size > 0:
         return destination
+    if cache_dir is not None:
+        raise FileNotFoundError(f"no está en la caché pedida ({destination.name}); no se descarga")
     with _ytdlp({"format": "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]/b"}) as downloader:
         info = downloader.extract_info(candidate.url, download=False)
     formats = info.get("requested_formats") or [info]
@@ -911,9 +914,10 @@ def select_segment(
 
 
 def build_moment(
-    candidate: Candidate, shortest: float, longest: float, language: str, config: dict | None = None
+    candidate: Candidate, shortest: float, longest: float, language: str, config: dict | None = None,
+    cache_dir: Path | None = None,
 ) -> Moment:
-    path = fetch_media(candidate)
+    path = fetch_media(candidate, cache_dir)
     audio = load_audio(path)
     if audio.size == 0:
         raise RuntimeError("el clip no tiene audio")

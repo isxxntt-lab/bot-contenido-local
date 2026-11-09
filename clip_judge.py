@@ -90,14 +90,18 @@ class Judgement:
     criteria: dict = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    abstentions: list[str] = field(default_factory=list)
+    decision: str = "rechazo"
 
     def to_dict(self) -> dict:
         return {
             "aceptado": self.accepted,
+            "decision": self.decision,
             "puntuacion": round(self.score, 3),
             "criterios": self.criteria,
             "motivos": self.reasons,
             "avisos": self.warnings,
+            "abstenciones": self.abstentions,
         }
 
     @property
@@ -163,12 +167,18 @@ def judge(
     # remate
     after = segment.end - segment.peak
     words_after = [word for word in inside if word.start >= segment.peak]
-    payoff = after >= float(s["remate_min_segundos"]) and bool(words_after)
+    before = [word for word in inside if word.start < segment.peak - 1e-3]
+    payoff = after >= float(s["remate_min_segundos"]) and bool(words_after) and bool(before)
+    if not before:
+        remate_motivo = "el pico abre el tramo; el tiempo posterior no demuestra un remate"
+    elif payoff:
+        remate_motivo = f"{after:.1f} s y {len(words_after)} palabras tras el pico, con voz antes"
+    else:
+        remate_motivo = f"acaba en el pico: {after:.1f} s y {len(words_after)} palabras después"
     put(
         "remate",
-        1.0 if payoff else (0.5 if after >= float(s["remate_min_segundos"]) else 0.0),
-        f"{after:.1f} s y {len(words_after)} palabras tras el pico" if payoff
-        else f"acaba en el pico: {after:.1f} s y {len(words_after)} palabras después",
+        1.0 if payoff else (0.5 if after >= float(s["remate_min_segundos"]) and bool(before) else 0.0),
+        remate_motivo,
     )
     # autocontención
     points = 1.0
@@ -208,10 +218,19 @@ def judge(
     if score < float(s["puntuacion_min"]):
         reasons.append(f"puntuación {score:.2f} < {float(s['puntuacion_min']):.2f}")
     reasons = list(dict.fromkeys(reasons))
+    # Solo cuando el mínimo de duración obliga a traer otra unidad. Una pausa
+    # corta, dentro de la misma unidad, no entra aquí.
+    abstentions = []
+    if segment.crosses_units:
+        abstentions.append(
+            "abstencion: se unió otra unidad solo para la duración mínima; no hay evidencia de una sola historia"
+        )
     blocking = {item.split(":", 1)[0] for item in reasons}
     warnings = [
         f"{name}: {criteria[name]['motivo']}"
         for name, item in criteria.items()
         if not item["ok"] and name not in blocking
     ]
-    return Judgement(not reasons, score, criteria, reasons, warnings)
+    accepted = not reasons and not abstentions
+    decision = "aceptado" if accepted else "rechazo" if reasons else "abstencion"
+    return Judgement(accepted, score, criteria, reasons, warnings, abstentions, decision)

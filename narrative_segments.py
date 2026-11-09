@@ -116,8 +116,8 @@ def split_sentences(
     """Frases por puntuación final o pausa larga.
 
     La primera frase está «abierta» si la voz ya sonaba al empezar el clip (empieza
-    a menos de ``edge`` segundos del inicio) y la última si el clip la corta (sin
-    puntuación y a menos de ``edge`` segundos del final).
+    a menos de ``edge`` segundos del inicio). La última solo está cerrada si tiene
+    puntuación: el silencio que queda al final del archivo no es un punto.
     """
     sentences: list[Sentence] = []
     first = 0
@@ -131,7 +131,7 @@ def split_sentences(
                 Sentence(
                     first, index, chunk[0].start, chunk[-1].end,
                     " ".join(item.text.strip() for item in chunk),
-                    closed=punctuated or following is not None or (total is not None and total - word.end >= edge),
+                    closed=punctuated or following is not None,
                     clean_start=bool(first > 0 or chunk[0].start >= edge),
                 )
             )

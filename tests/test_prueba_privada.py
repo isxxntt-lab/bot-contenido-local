@@ -145,6 +145,40 @@ def test_main_vacio_no_dispara_publicacion(tmp_path, monkeypatch):
     assert "PRUEBA PRIVADA" in (tmp_path / "out" / "README.txt").read_text(encoding="utf-8")
 
 
+def test_cache_alterno_no_llama_a_ytdlp_ni_publica(tmp_path, monkeypatch):
+    _tripwires(monkeypatch)
+    calls: list[str] = []
+
+    def _no_download(*_args, **_kwargs):
+        calls.append("yt-dlp")
+        raise AssertionError("yt-dlp no debe arrancar")
+
+    monkeypatch.setattr(clipazos, "_ytdlp", _no_download)
+    monkeypatch.setattr(clipazos, "CACHE_DIR", tmp_path / "global-vacio")
+    alt = tmp_path / "cache-pedido"
+    alt.mkdir()
+    (alt / "twitch-Abc.mp4").write_bytes(b"video-local")
+    found = clipazos.fetch_media(_candidate(), cache_dir=alt)
+    assert found == alt / "twitch-Abc.mp4"
+    assert calls == []
+    empty = tmp_path / "cache-ausente"
+    empty.mkdir()
+    try:
+        clipazos.fetch_media(_candidate(), cache_dir=empty)
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError("un caché vacío no puede seguir como si hubiera archivo")
+    assert calls == []
+    try:
+        clipazos.fetch_media(_candidate())
+    except AssertionError as exc:
+        assert "yt-dlp" in str(exc)
+    else:
+        raise AssertionError("sin caché explícita la producción sí intenta descargar")
+    assert calls == ["yt-dlp"]
+
+
 def test_catalogo_solo_usa_la_cache(tmp_path):
     cache = tmp_path / "cache"
     cache.mkdir()
