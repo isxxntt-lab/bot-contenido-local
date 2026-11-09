@@ -119,6 +119,26 @@ def build_request(model: str, prompt: str, images: list[str], num_ctx: int, keep
     }
 
 
+def entrada_identica(juicio: dict, enviado: dict) -> bool:
+    """El preflight solo puede cambiar el tope de salida. El resto del cuerpo es el del juicio."""
+    try:
+        left = json.loads(json.dumps(juicio))
+        right = json.loads(json.dumps(enviado))
+        if left["options"]["num_predict"] != 220 or right["options"]["num_predict"] != 1:
+            return False
+        left["options"]["num_predict"] = 0
+        right["options"]["num_predict"] = 0
+    except (KeyError, TypeError):
+        return False
+    return left == right
+
+
+def cuerpo_preflight(juicio: dict) -> dict:
+    sent = json.loads(json.dumps(juicio))
+    sent["options"]["num_predict"] = 1
+    return sent
+
+
 def prompt_for(coverage: dict) -> str:
     """Los textos del clip van como datos. No se le pide que obedezca lo que dicen."""
     payload = {
@@ -219,6 +239,54 @@ class OllamaVision:
             trace["error"] = "runtime contextual sin texto"
         elif payload.get("done_reason") == "length":
             trace["error"] = "salida cortada por num_predict; no se completa a mano"
+        return trace
+
+    def preflight(self, prompt: str, images: list[str]) -> dict:
+        """Mide la entrada completa. Genera un token y lo descarta; no es un juicio."""
+        juicio = build_request(self.model, prompt, images, self.num_ctx, self.keep_alive)
+        enviado = cuerpo_preflight(juicio)
+        trace = {
+            "raw": "",
+            "done_reason": None,
+            "prompt_eval_count": None,
+            "eval_count": None,
+            "load_duration_ms": None,
+            "total_duration_ms": None,
+            "error": None,
+            "num_ctx": self.num_ctx,
+            "num_predict_enviado": 1,
+            "n_images": len(images),
+            "prompt_chars": len(prompt),
+            "contenido_descartado": True,
+        }
+        if not entrada_identica(juicio, enviado):
+            trace["error"] = "la petición de preflight no conserva la entrada del juicio"
+            trace["done_reason"] = "entrada_distinta"
+            return trace
+        request = urllib.request.Request(
+            self.base_url + "/api/chat",
+            data=json.dumps(enviado).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:500]
+            trace["error"] = f"HTTP {exc.code}: {detail}"
+            trace["done_reason"] = "http_error"
+            return trace
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+            trace["error"] = f"runtime contextual: {exc}"
+            trace["done_reason"] = "runtime"
+            return trace
+        trace["done_reason"] = payload.get("done_reason")
+        trace["prompt_eval_count"] = payload.get("prompt_eval_count")
+        trace["eval_count"] = payload.get("eval_count")
+        if payload.get("load_duration") is not None:
+            trace["load_duration_ms"] = round(payload["load_duration"] / 1e6, 1)
+        if payload.get("total_duration") is not None:
+            trace["total_duration_ms"] = round(payload["total_duration"] / 1e6, 1)
         return trace
 
 

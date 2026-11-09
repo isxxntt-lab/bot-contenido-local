@@ -544,26 +544,148 @@ def plan_contextual(cuts):
     return paquete_contextual.frame_plan(cuts)
 
 
-def _contextual_view(moment, video: Path, client, folder: Path, medicion=None, duracion_fuente: float | None = None) -> dict:
-    """Arma el paquete compartido y no llama al modelo.
-
-    El cliente y la carpeta de fotogramas quedan sin usar hasta una evaluación
-    futura que mida el presupuesto sobre este paquete. Los subtítulos del corto
-    no sustituyen al ASR de origen.
-    """
+def materializar_receta(video: Path, cuts, folder: Path) -> list[dict] | None:
+    """Escribe los tres fotogramas de la receta común. No rotula ni reencuadra."""
     import paquete_contextual
 
-    del client, folder
+    plan = paquete_contextual.frame_plan(cuts)
+    if len(plan) != paquete_contextual.FRAME_COUNT:
+        return None
+    written = []
+    for item in plan:
+        dest = folder / f"punto_{item['indice']}" / "frame.jpg"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            [_ffmpeg_exe(), "-y", "-v", "error", "-ss", item["seek"], "-i", str(video),
+             "-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "5", str(dest)],
+            capture_output=True,
+        )
+        if result.returncode != 0 or not dest.is_file() or dest.stat().st_size <= 0:
+            return None
+        stamped = dict(item)
+        stamped["materializado"] = True
+        stamped["archivo"] = str(dest)
+        stamped["sha256"] = paquete_contextual.sha256_file(dest)
+        stamped["bytes"] = dest.stat().st_size
+        written.append(stamped)
+    return written
+
+
+def _medir_paquete(package: dict, client, schema: dict) -> dict:
+    """Preflight de la entrada congelada. No llama a complete ni lee una decisión."""
+    import juez_contextual
+    import paquete_contextual
+
+    coverage = paquete_contextual.cobertura_entrada(package)
+    frames = package.get("fotogramas") or []
+    if coverage is None or any(not item.get("sha256") or not item.get("materializado") for item in frames):
+        package = dict(package)
+        package["preflight"] = {"aplicada": False, "motivo": "faltan palabras de dentro o fotogramas hasheados"}
+        return package
+    paths = []
+    shas = []
+    for item in frames:
+        path = Path(item["archivo"])
+        digest = paquete_contextual.sha256_file(path)
+        if digest != item["sha256"]:
+            package = dict(package)
+            package["preflight"] = {"aplicada": False, "motivo": "el fotograma en disco no coincide con el hash del paquete"}
+            return package
+        paths.append(path)
+        shas.append(digest)
+    prompt = juez_contextual.prompt_for(coverage)
+    huella = paquete_contextual.huella_entrada(prompt, schema, shas, paquete_contextual.NUM_CTX)
+    images = [juez_contextual._image_b64(path) for path in paths]
+    trace = client.preflight(prompt, images)
+    updated = paquete_contextual.aplicar_preflight(package, trace, huella, huella)
+    updated["congelado"] = {
+        "receta": paquete_contextual.RECIPE_ID,
+        "schema_sha256": hashlib.sha256(
+            json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "entrada_sha256": huella,
+        "frames": shas,
+        "num_ctx": paquete_contextual.NUM_CTX,
+        "margen_salida": paquete_contextual.NUM_PREDICT,
+    }
+    return updated
+
+
+def capturar_evidencia(video: Path, folder: Path, config: dict) -> dict:
+    """ASR de origen y tres fotogramas de una fuente ya en disco. No renderiza un short."""
+    import paquete_contextual
+
+    folder.mkdir(parents=True, exist_ok=True)
+    probe = qa.probe(video)
+    audio = clipazos.load_audio(video)
+    words = clipazos.transcribe(audio, config.get("idioma", "es"))
+    segment, length, _cues, _peak, cuts, _judgement = clipazos.select_segment(audio, words, config)
+    moment = type("Captura", (), {})()
+    moment.start = segment.start
+    moment.cuts = list(cuts)
+    moment.source_words = list(words)
+    moment.segment = segment.to_dict()
+    moment.length = length
+    package = paquete_contextual.paquete_de_momento(moment, video, duracion_fuente=probe.get("duracion"))
+    frames = materializar_receta(video, list(cuts), folder / "frames")
+    if frames:
+        package["fotogramas"] = frames
+        package["receta"] = dict(package["receta"])
+        package["receta"]["materializada"] = True
+    package["origen_palabras"] = {
+        "motor": "faster-whisper",
+        "modelo": clipazos.WHISPER_MODEL,
+        "dispositivo": "cpu",
+        "compute_type": "int8",
+        "reloj": "segundos de la fuente",
+        "n": len(words),
+    }
+    package["selector"] = {
+        "funcion": "clipazos.select_segment",
+        "inicio": segment.start,
+        "fin": segment.end,
+        "duracion_corte": length,
+        "exportado": False,
+        "no_es_juicio_visual": True,
+    }
+    package["test_only"] = True
+    package["publication_eligible"] = False
+    package["ready_for_manual_upload"] = False
+    package["ensayo_hecho"] = False
+    package["rights_status"] = "unknown"
+    return package
+
+
+def _contextual_view(moment, video: Path, client, folder: Path, medicion=None, duracion_fuente: float | None = None) -> dict:
+    """Arma el paquete. Si solo falta el presupuesto, mide la entrada y no juzga."""
+    import juez_contextual
+    import paquete_contextual
+
     package = paquete_contextual.paquete_de_momento(
         moment, video, duracion_fuente=duracion_fuente, medicion=medicion,
     )
     reason = paquete_contextual.motivo_de_bloqueo(package)
+    cliente = "no_llamado"
+    if reason.startswith("abstención: presupuesto") and getattr(client, "preflight", None):
+        frames = materializar_receta(video, list(getattr(moment, "cuts", None) or []), folder)
+        if not frames:
+            reason = "abstención: no se materializaron los tres fotogramas de la receta"
+        else:
+            package["fotogramas"] = frames
+            package["receta"] = dict(package["receta"])
+            package["receta"]["materializada"] = True
+            package = _medir_paquete(package, client, juez_contextual.OUTPUT_SCHEMA)
+            cliente = "preflight"
+            reason = paquete_contextual.motivo_de_bloqueo(package)
+    if not reason:
+        reason = "presupuesto medido; la evaluación narrativa no está hecha"
     return {
         "decision": "abstain",
-        "motivo": reason or "paquete completo; la evaluación con el modelo no está hecha",
+        "motivo": reason,
         "valido": False,
         "evidencias": [],
-        "cliente": "no_llamado",
+        "cliente": cliente,
         "paquete": package,
     }
 

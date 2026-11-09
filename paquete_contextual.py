@@ -8,6 +8,7 @@ abstención. Tres fotogramas no declaran un cierre.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -299,6 +300,82 @@ def construir_paquete(
         "corte_fuera_de_fuente": fuera,
         "ass_es_asr_original": False,
     }
+
+
+def cobertura_entrada(package: dict) -> dict | None:
+    """Palabras de dentro, en el reloj del corte. Lo de fuera no entra en la petición."""
+    words = package.get("palabras") or {}
+    mapa = package.get("mapa") or {}
+    if words.get("estado") != "presente" or mapa.get("estado") != "explicito":
+        return None
+    inside = []
+    for item in words.get("inside") or []:
+        if item.get("t0_corte") is None or item.get("t1_corte") is None:
+            return None
+        inside.append({
+            "i": item["i"],
+            "t0": item["t0_corte"],
+            "t1": item["t1_corte"],
+            "texto": item["texto"],
+        })
+    return {
+        "inicio": 0.0,
+        "fin": mapa["duracion_corte"],
+        "palabras": inside,
+        "fotogramas": [item["reloj_corte"] for item in package.get("fotogramas") or []],
+    }
+
+
+def huella_entrada(prompt: str, schema: dict, frame_shas: list[str], num_ctx: int) -> str:
+    payload = {
+        "prompt": prompt,
+        "schema": schema,
+        "frames": frame_shas,
+        "num_ctx": num_ctx,
+        "margen_salida": NUM_PREDICT,
+        "receta": RECIPE_ID,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def aplicar_preflight(package: dict, trace: dict, huella_paquete: str, huella_enviada: str) -> dict:
+    """Incorpora solo un conteo del backend. Una salida de texto no es una medición ni un juicio."""
+    updated = dict(package)
+    info = {
+        "aplicada": False,
+        "huella_coincide": huella_paquete == huella_enviada,
+        "contenido_descartado": not bool(trace.get("raw")),
+        "num_predict_enviado": trace.get("num_predict_enviado"),
+        "eval_count": trace.get("eval_count"),
+        "done_reason": trace.get("done_reason"),
+        "error": trace.get("error"),
+        "motivo": "",
+    }
+    if trace.get("raw"):
+        info["motivo"] = "la salida no se descartó; no cuenta como medición ni como decisión"
+    elif not info["huella_coincide"]:
+        info["motivo"] = "la entrada medida no es la del paquete"
+    elif trace.get("error"):
+        info["motivo"] = str(trace["error"])
+    elif trace.get("num_predict_enviado") != 1:
+        info["motivo"] = "el preflight no limitó la generación a un token descartado"
+    elif not isinstance(trace.get("prompt_eval_count"), int):
+        info["motivo"] = "el backend no devolvió prompt_eval_count"
+    elif trace.get("num_ctx") != NUM_CTX:
+        info["motivo"] = "la medición no usa el contexto congelado"
+    else:
+        updated["presupuesto"] = presupuesto({
+            "origen": "backend",
+            "prompt_eval_count": trace["prompt_eval_count"],
+            "num_ctx": NUM_CTX,
+            "num_predict": NUM_PREDICT,
+        })
+        info["aplicada"] = updated["presupuesto"]["estado"] == "medido"
+        info["motivo"] = updated["presupuesto"]["motivo"]
+    updated["preflight"] = info
+    updated["ensayo_hecho"] = False
+    return updated
 
 
 def motivo_de_bloqueo(package: dict) -> str:

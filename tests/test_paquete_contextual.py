@@ -1,5 +1,6 @@
 """El paquete contextual falla cerrado. Los ejemplos no son los clips del lote B."""
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -177,3 +178,141 @@ def test_un_filtro_con_silencio_recupera_el_mapa_sin_inventar_palabras(tmp_path)
     assert seen["fotogramas"] == paquete_contextual.frame_plan(_cuts())
     assert seen["cliente"] == "no_llamado"
     assert seen["ensayo_hecho"] is False
+
+
+def _trace(count, **extra):
+    data = {
+        "raw": "",
+        "prompt_eval_count": count,
+        "eval_count": 1,
+        "done_reason": "length",
+        "error": None,
+        "num_ctx": paquete_contextual.NUM_CTX,
+        "num_predict_enviado": 1,
+    }
+    data.update(extra)
+    return data
+
+
+def test_la_entrada_del_preflight_es_la_del_paquete_y_deja_fuera_el_contexto():
+    package = _package()
+    coverage = paquete_contextual.cobertura_entrada(package)
+    texts = [item["texto"] for item in coverage["palabras"]]
+    assert texts == ["entra", "mira", "sigue"]
+    assert "despues" not in texts and "fuera" not in texts
+    import juez_contextual
+    prompt = juez_contextual.prompt_for(coverage)
+    huella = paquete_contextual.huella_entrada(prompt, juez_contextual.OUTPUT_SCHEMA, ["a", "b", "c"], 5120)
+    body = juez_contextual.build_request("modelo", prompt, ["img"], 5120, 0)
+    sent = juez_contextual.cuerpo_preflight(body)
+    assert juez_contextual.entrada_identica(body, sent)
+    sent["messages"][0]["images"] = ["otra"]
+    assert juez_contextual.entrada_identica(body, sent) is False
+    assert huella != paquete_contextual.huella_entrada(prompt, juez_contextual.OUTPUT_SCHEMA, ["a", "b", "d"], 5120)
+
+
+def test_el_preflight_se_cierra_si_el_presupuesto_no_cabe_o_la_entrada_cambia():
+    package = _package()
+    huella = "misma"
+    medido = paquete_contextual.aplicar_preflight(package, _trace(100), huella, huella)
+    assert medido["presupuesto"]["cabe"] is True
+    assert medido["ensayo_hecho"] is False
+    assert medido["preflight"]["contenido_descartado"] is True
+    grande = paquete_contextual.aplicar_preflight(package, _trace(5000), huella, huella)
+    assert grande["presupuesto"]["cabe"] is False
+    assert "presupuesto" in paquete_contextual.motivo_de_bloqueo(grande)
+    distinta = paquete_contextual.aplicar_preflight(package, _trace(100), huella, "otra")
+    assert distinta["preflight"]["aplicada"] is False
+    assert distinta["presupuesto"]["estado"] == "desconocido"
+    truncada = paquete_contextual.aplicar_preflight(
+        package, _trace(None, error="HTTP 400: request exceeds the available context size", prompt_eval_count=None),
+        huella, huella,
+    )
+    assert truncada["preflight"]["aplicada"] is False
+    assert truncada["presupuesto"]["tokens_entrada"] is None
+    con_texto = paquete_contextual.aplicar_preflight(package, _trace(100, raw='{"decision":"accept"}'), huella, huella)
+    assert con_texto["preflight"]["aplicada"] is False
+
+
+def test_el_preflight_real_no_conserva_el_texto(monkeypatch):
+    import juez_contextual
+
+    class Respuesta:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "message": {"content": '{"decision": "accept"}'},
+                "done_reason": "length",
+                "prompt_eval_count": 80,
+                "eval_count": 1,
+            }).encode()
+
+    monkeypatch.setattr(juez_contextual.urllib.request, "urlopen", lambda *_a, **_k: Respuesta())
+    trace = juez_contextual.OllamaVision("http://127.0.0.1:9", "modelo").preflight("prompt", ["aW1n"])
+    assert trace["raw"] == ""
+    assert trace["prompt_eval_count"] == 80
+    assert trace["contenido_descartado"] is True
+    assert "accept" not in json.dumps(trace)
+
+
+def test_la_vista_mide_el_mismo_paquete_y_no_juzga(tmp_path):
+    import subprocess
+    from video_editor import _ffmpeg_exe
+
+    video = tmp_path / "fuente.mp4"
+    subprocess.run(
+        [_ffmpeg_exe(), "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=blue:s=160x90:d=10",
+         "-t", "10", str(video)],
+        check=True,
+    )
+    seen = {}
+
+    class Medidor:
+        def preflight(self, prompt, images):
+            seen["prompt"] = prompt
+            seen["n"] = len(images)
+            return _trace(100)
+
+        def complete(self, prompt, images):
+            seen["juzgo"] = True
+
+    words = [
+        CaptionCue("antes", 0.1, 0.3),
+        CaptionCue("entra", 1.0, 1.4),
+        CaptionCue("mira", 3.0, 3.4),
+        CaptionCue("despues", 9.2, 9.5),
+    ]
+    moment = SimpleNamespace(start=0.5, cuts=[(0.5, 8.5)], source_words=words, segment=None, cues=[])
+    verdict = prueba_privada._contextual_view(moment, video, Medidor(), tmp_path / "frames", duracion_fuente=10.0)
+    assert seen["n"] == 3
+    assert "entra" in seen["prompt"] and "despues" not in seen["prompt"]
+    assert "juzgo" not in seen
+    assert verdict["cliente"] == "preflight"
+    assert verdict["decision"] == "abstain"
+    assert verdict["paquete"]["presupuesto"]["tokens_entrada"] == 100
+    assert verdict["paquete"]["presupuesto"]["cabe"] is True
+    assert verdict["paquete"]["ensayo_hecho"] is False
+    assert [item["reloj_fuente"] for item in verdict["paquete"]["fotogramas"]] == [0.5, 4.5, 8.45]
+    assert all(item["sha256"] and item["materializado"] for item in verdict["paquete"]["fotogramas"])
+
+
+def test_un_corte_fuera_de_la_fuente_no_llega_al_preflight(tmp_path):
+    called = []
+
+    class Medidor:
+        def preflight(self, prompt, images):
+            called.append(1)
+            return _trace(100)
+
+    moment = SimpleNamespace(start=10.0, cuts=_cuts(), source_words=_words(), segment=None, cues=[])
+    verdict = prueba_privada._contextual_view(
+        moment, tmp_path / "no.mp4", Medidor(), tmp_path / "frames", duracion_fuente=12.0,
+    )
+    assert called == []
+    assert verdict["cliente"] == "no_llamado"
+    assert "fuente" in verdict["motivo"]
