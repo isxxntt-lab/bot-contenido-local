@@ -194,6 +194,14 @@ class ObservadorLog:
     def marca(self) -> int:
         return self.path.stat().st_size if self.path.is_file() else 0
 
+    def texto_hasta(self, marca: int) -> str:
+        if not self.path.is_file():
+            return ""
+        data = self.path.read_bytes()
+        if not isinstance(marca, int) or marca < 0 or marca > len(data):
+            return ""
+        return data[:marca].decode("utf-8", "replace")
+
     def texto_desde(self, marca: int) -> str:
         if not self.path.is_file():
             return ""
@@ -227,12 +235,12 @@ class OllamaVision:
         models = payload.get("models") if isinstance(payload, dict) else None
         if not isinstance(models, list):
             return {"ok": False, "motivo": "el runtime no devolvió la lista de modelos"}
-        chosen = next((item for item in models if isinstance(item, dict) and item.get("name") == self.model), None)
-        digest = chosen.get("digest") if isinstance(chosen, dict) else None
-        if not isinstance(digest, str) or not digest:
-            return {"ok": False, "motivo": "el runtime no devolvió digest para este modelo"}
-        self.digest = digest
-        return {"ok": True, "modelo": self.model, "digest": digest, "fuente": "/api/tags"}
+        chosen = [item for item in models if isinstance(item, dict) and item.get("name") == self.model]
+        digests = [item.get("digest") for item in chosen]
+        if not chosen or any(not isinstance(item, str) or not item for item in digests) or len(set(digests)) != 1:
+            return {"ok": False, "motivo": "la identificación del modelo es ambigua o no trae digest"}
+        self.digest = digests[0]
+        return {"ok": True, "modelo": self.model, "digest": digests[0], "fuente": "/api/tags"}
 
     def complete(self, prompt: str, images: list[str]) -> dict:
         body = build_request(self.model, prompt, images, self.num_ctx, self.keep_alive)
@@ -250,9 +258,11 @@ class OllamaVision:
             "prompt_chars": len(prompt),
         }
         marca = self.observador.marca() if self.observador is not None else None
+        wire = json.dumps(body).encode("utf-8")
+        trace["cuerpo_bytes_sha256"] = hashlib.sha256(wire).hexdigest()
         request = urllib.request.Request(
             self.base_url + "/api/chat",
-            data=json.dumps(body).encode("utf-8"),
+            data=wire,
             headers={"Content-Type": "application/json"},
         )
         try:
@@ -274,7 +284,8 @@ class OllamaVision:
         trace["eval_count"] = payload.get("eval_count")
         trace["modelo"] = self.model
         trace["digest"] = self.digest
-        trace["log_nuevo"] = self.observador.texto_desde(marca) if self.observador is not None and marca is not None else ""
+        trace["log_previo"] = self.observador.texto_hasta(marca) if self.observador is not None and marca is not None else None
+        trace["log_nuevo"] = self.observador.texto_desde(marca) if self.observador is not None and marca is not None else None
         if payload.get("load_duration") is not None:
             trace["load_duration_ms"] = round(payload["load_duration"] / 1e6, 1)
         if payload.get("total_duration") is not None:
@@ -308,9 +319,11 @@ class OllamaVision:
             trace["done_reason"] = "entrada_distinta"
             return trace
         marca = self.observador.marca() if self.observador is not None else None
+        wire = json.dumps(enviado).encode("utf-8")
+        trace["cuerpo_bytes_sha256"] = hashlib.sha256(wire).hexdigest()
         request = urllib.request.Request(
             self.base_url + "/api/chat",
-            data=json.dumps(enviado).encode("utf-8"),
+            data=wire,
             headers={"Content-Type": "application/json"},
         )
         try:
@@ -330,10 +343,9 @@ class OllamaVision:
         trace["eval_count"] = payload.get("eval_count")
         trace["modelo"] = self.model
         trace["digest"] = self.digest
-        trace["log_nuevo"] = self.observador.texto_desde(marca) if self.observador is not None and marca is not None else ""
-        trace["cuerpo_sha256"] = hashlib.sha256(
-            json.dumps(enviado, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        trace["log_previo"] = self.observador.texto_hasta(marca) if self.observador is not None and marca is not None else None
+        trace["log_nuevo"] = self.observador.texto_desde(marca) if self.observador is not None and marca is not None else None
+        trace["cuerpo_bytes_sha256"] = hashlib.sha256(wire).hexdigest()
         trace["correlacion"] = {
             "valida": False,
             "truncated": None,

@@ -320,15 +320,71 @@ def _limites(palabras: dict) -> dict:
     }
 
 
-_TRUNCADO = re.compile(r"stop processing: n_tokens = (\d+), truncated = (\d+)")
+_PARADA = re.compile(
+    r"slot\s+release:\s+id\s+(\d+)\s+\|\s+task\s+(\d+)\s+\|\s+stop processing:\s+n_tokens = (\d+), truncated = (\d+)"
+)
+_POST_CHAT = re.compile(r'POST\s+"/api/chat"')
+
+
+def paradas_en_log(texto: str) -> list[dict]:
+    """Solo renglones con slot y task. Sin esos ids no hay atribución."""
+    found = []
+    for slot, task, tokens, flag in _PARADA.findall(texto or ""):
+        found.append({
+            "slot": int(slot),
+            "task": int(task),
+            "n_tokens": int(tokens),
+            "truncated": int(flag),
+        })
+    return found
 
 
 def truncados_en_log(texto: str) -> list[dict]:
-    """Lee el renglón real del runner. Si no está, no devuelve 0."""
-    found = []
-    for tokens, flag in _TRUNCADO.findall(texto or ""):
-        found.append({"n_tokens": int(tokens), "truncated": int(flag)})
-    return found
+    """Compatibilidad: mismas paradas, sin inventar un 0 si el renglón no trae ids."""
+    return paradas_en_log(texto)
+
+
+def correlacionar_observacion(respuesta: dict) -> dict:
+    """El buffer del log no tiene que igualar al conteo de la API. Sí tiene que ser el de esta petición."""
+    vacio = {
+        "valida": False,
+        "truncated": None,
+        "prompt_eval_count": None,
+        "eval_count": None,
+        "buffer_n_tokens": None,
+        "motivo": "no hay observación de esta llamada",
+    }
+    if not isinstance(respuesta, dict):
+        return vacio
+    count = respuesta.get("prompt_eval_count")
+    if not isinstance(count, int):
+        return {**vacio, "motivo": "la respuesta no trae prompt_eval_count"}
+    if not respuesta.get("modelo") or not respuesta.get("digest"):
+        return {**vacio, "motivo": "no hay modelo o digest observado en el runtime"}
+    if not isinstance(respuesta.get("log_previo"), str) or not isinstance(respuesta.get("log_nuevo"), str):
+        return {**vacio, "motivo": "falta el log previo o el nuevo; no se puede excluir un renglón viejo"}
+    previas = {(item["slot"], item["task"]) for item in paradas_en_log(respuesta["log_previo"])}
+    nuevas = [item for item in paradas_en_log(respuesta["log_nuevo"]) if (item["slot"], item["task"]) not in previas]
+    posts = len(_POST_CHAT.findall(respuesta["log_nuevo"]))
+    base = {
+        "prompt_eval_count": count,
+        "eval_count": respuesta.get("eval_count") if isinstance(respuesta.get("eval_count"), int) else None,
+    }
+    if len(nuevas) != 1 or posts != 1:
+        return {**vacio, **base, "motivo": "el log nuevo no ata una única parada y un único POST a esta llamada"}
+    linea = nuevas[0]
+    return {
+        "valida": linea["truncated"] == 0,
+        "truncated": linea["truncated"],
+        "n_tokens": linea["n_tokens"],
+        "buffer_n_tokens": linea["n_tokens"],
+        "slot": linea["slot"],
+        "task": linea["task"],
+        "modelo": respuesta["modelo"],
+        "digest": respuesta["digest"],
+        **base,
+        "motivo": "parada nueva de esta llamada" if linea["truncated"] == 0 else f"truncated={linea['truncated']}",
+    }
 
 
 def cobertura_entrada(package: dict) -> dict | None:
@@ -366,33 +422,6 @@ def huella_entrada(prompt: str, schema: dict, frame_shas: list[str], num_ctx: in
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def correlacionar_observacion(respuesta: dict) -> dict:
-    """Lee el log nuevo de esta llamada. Un entero suelto no cuenta y la ausencia no es 0."""
-    vacio = {"valida": False, "truncated": None, "motivo": "no hay observación de esta llamada"}
-    if not isinstance(respuesta, dict):
-        return vacio
-    count = respuesta.get("prompt_eval_count")
-    if not isinstance(count, int):
-        return {**vacio, "motivo": "la respuesta no trae prompt_eval_count"}
-    if not respuesta.get("modelo") or not respuesta.get("digest"):
-        return {**vacio, "motivo": "no hay modelo o digest observado en el runtime"}
-    texto = respuesta.get("log_nuevo")
-    if not isinstance(texto, str) or not texto.strip():
-        return {**vacio, "motivo": "no hay log nuevo de esta llamada"}
-    coinciden = [item for item in truncados_en_log(texto) if item["n_tokens"] == count]
-    if len(coinciden) != 1:
-        return {**vacio, "motivo": "el log nuevo no ata un único renglón a este conteo"}
-    flag = coinciden[0]["truncated"]
-    return {
-        "valida": flag == 0,
-        "truncated": flag,
-        "n_tokens": count,
-        "modelo": respuesta["modelo"],
-        "digest": respuesta["digest"],
-        "motivo": "log nuevo de esta llamada" if flag == 0 else f"truncated={flag}",
-    }
 
 
 def instantanea_entrada(
@@ -453,8 +482,8 @@ def aplicar_preflight(package: dict, trace: dict, instantanea_releida: dict) -> 
         info["motivo"] = "la medición no usa el contexto congelado"
     elif not isinstance(instantanea_releida, dict) or not instantanea_releida.get("huella"):
         info["motivo"] = "no hay relectura independiente de la entrada"
-    elif trace.get("cuerpo_sha256") != instantanea_releida.get("cuerpo_sha256"):
-        info["motivo"] = "el cuerpo que el transporte dice haber enviado no es el de la relectura"
+    elif trace.get("cuerpo_bytes_sha256") != instantanea_releida.get("cuerpo_bytes_sha256"):
+        info["motivo"] = "los bytes enviados no son los de la relectura"
     elif not corr["valida"]:
         info["motivo"] = corr["motivo"]
     else:
@@ -468,7 +497,7 @@ def aplicar_preflight(package: dict, trace: dict, instantanea_releida: dict) -> 
         updated["congelado"] = {
             "huella": instantanea_releida["huella"],
             "campos": instantanea_releida.get("campos"),
-            "cuerpo_sha256": instantanea_releida.get("cuerpo_sha256"),
+            "cuerpo_bytes_sha256": instantanea_releida.get("cuerpo_bytes_sha256"),
         }
         info["aplicada"] = updated["presupuesto"]["estado"] == "medido" and updated["presupuesto"]["cabe"] is True
         info["motivo"] = updated["presupuesto"]["motivo"] if info["aplicada"] else "la entrada medida no deja el margen de salida"

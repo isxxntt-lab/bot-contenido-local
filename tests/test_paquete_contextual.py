@@ -217,7 +217,7 @@ def test_la_entrada_del_preflight_es_la_del_paquete_y_deja_fuera_el_contexto():
 
 def test_el_preflight_se_cierra_sin_correlacion_de_esta_llamada():
     package = _package()
-    inst = {"huella": "h", "cuerpo_sha256": "cuerpo", "campos": {"prompt": "p"}}
+    inst = {"huella": "h", "cuerpo_bytes_sha256": "cuerpo", "campos": {"prompt": "p"}}
     base = {
         "raw": "",
         "prompt_eval_count": 4799,
@@ -231,29 +231,46 @@ def test_el_preflight_se_cierra_sin_correlacion_de_esta_llamada():
         "digest": "digest",
         "inicio_ms": 0,
         "fin_ms": 20,
-        "cuerpo_sha256": "cuerpo",
+        "cuerpo_bytes_sha256": "cuerpo",
         "modelo": "modelo",
         "digest": "digest",
-        "log_nuevo": "stop processing: n_tokens = 4799, truncated = 0\n",
+        "eval_count": 1,
+        "log_previo": "",
+        "log_nuevo": (
+            "slot      release: id  0 | task 1 | stop processing: n_tokens = 3611, truncated = 0\n"
+            '[GIN] POST     "/api/chat"\n'
+        ),
     }
     ok = paquete_contextual.aplicar_preflight(package, base, inst)
     assert ok["preflight"]["aplicada"] is True
-    assert ok["correlacion"]["valida"] is True
-    assert ok["correlacion"]["truncated"] == 0
+    assert ok["correlacion"]["buffer_n_tokens"] == 3611
+    assert ok["correlacion"]["prompt_eval_count"] == 4799
+    juicio = dict(base, prompt_eval_count=3611, eval_count=159, log_previo=base["log_nuevo"], log_nuevo=(
+        "slot      release: id  0 | task 2 | stop processing: n_tokens = 3769, truncated = 0\n"
+        '[GIN] POST     "/api/chat"\n'
+    ))
+    adoptado = paquete_contextual.aplicar_preflight(package, juicio, inst)
+    assert adoptado["preflight"]["aplicada"] is True
+    assert adoptado["correlacion"]["buffer_n_tokens"] == 3769
+    assert adoptado["correlacion"]["prompt_eval_count"] == 3611
+    assert adoptado["correlacion"]["eval_count"] == 159
     sin_log = dict(base, log_nuevo="")
-    cerrado = paquete_contextual.aplicar_preflight(package, sin_log, inst)
-    assert cerrado["preflight"]["aplicada"] is False
-    assert "truncated" not in sin_log
+    assert paquete_contextual.aplicar_preflight(package, sin_log, inst)["preflight"]["aplicada"] is False
     suelto = dict(base, log_nuevo="", truncated=0)
     assert paquete_contextual.aplicar_preflight(package, suelto, inst)["preflight"]["aplicada"] is False
-    viejo = dict(base, log_nuevo="stop processing: n_tokens = 100, truncated = 0\n")
-    assert paquete_contextual.aplicar_preflight(package, viejo, inst)["preflight"]["aplicada"] is False
-    doble = dict(base, log_nuevo=base["log_nuevo"] + base["log_nuevo"])
+    sin_post = dict(base, log_nuevo="slot      release: id  0 | task 1 | stop processing: n_tokens = 3611, truncated = 0\n")
+    assert paquete_contextual.aplicar_preflight(package, sin_post, inst)["preflight"]["aplicada"] is False
+    doble = dict(base, log_nuevo=base["log_nuevo"].replace("task 1", "task 3", 1) + base["log_nuevo"])
     assert paquete_contextual.aplicar_preflight(package, doble, inst)["preflight"]["aplicada"] is False
-    marcado = dict(base, log_nuevo="stop processing: n_tokens = 4799, truncated = 1\n")
+    marcado = dict(base, log_nuevo=base["log_nuevo"].replace("truncated = 0", "truncated = 1"))
     assert paquete_contextual.aplicar_preflight(package, marcado, inst)["preflight"]["aplicada"] is False
+    sin_previo = dict(base)
+    del sin_previo["log_previo"]
+    assert paquete_contextual.aplicar_preflight(package, sin_previo, inst)["preflight"]["aplicada"] is False
     sin_digest = dict(base, digest=None)
     assert paquete_contextual.aplicar_preflight(package, sin_digest, inst)["preflight"]["aplicada"] is False
+    misma_etiqueta = dict(base, cuerpo_bytes_sha256="otra")
+    assert paquete_contextual.aplicar_preflight(package, misma_etiqueta, {"huella": "h", "cuerpo_bytes_sha256": "h"})["preflight"]["aplicada"] is False
     misma_etiqueta = dict(base, cuerpo_sha256="otra")
     assert paquete_contextual.aplicar_preflight(package, misma_etiqueta, {"huella": "h", "cuerpo_sha256": "h"})["preflight"]["aplicada"] is False
     assert paquete_contextual.truncados_en_log("") == []
@@ -284,15 +301,20 @@ def test_el_preflight_real_no_conserva_el_texto(monkeypatch):
     assert trace["contenido_descartado"] is True
     assert "accept" not in json.dumps({k: v for k, v in trace.items() if k != "log_nuevo"})
     assert "truncated" not in trace
-    assert trace["log_nuevo"] == ""
+    assert trace["log_nuevo"] is None
 
 
 def test_el_cliente_real_solo_cambia_el_tope_y_lee_el_log_nuevo(tmp_path, monkeypatch):
+    import hashlib
     import juez_contextual
     log = tmp_path / "server.log"
-    log.write_text("stop processing: n_tokens = 1, truncated = 0\n", encoding="utf-8")
+    log.write_text(
+        "slot      release: id  0 | task 0 | stop processing: n_tokens = 1, truncated = 0\n",
+        encoding="utf-8",
+    )
     obs = juez_contextual.ObservadorLog(log)
-    enviados = []
+    crudos = []
+    tarea = {"n": 1}
 
     class Respuesta:
         def __enter__(self):
@@ -302,17 +324,22 @@ def test_el_cliente_real_solo_cambia_el_tope_y_lee_el_log_nuevo(tmp_path, monkey
             return False
 
         def read(self):
+            tarea["n"] += 1
             with log.open("a", encoding="utf-8") as handle:
-                handle.write("stop processing: n_tokens = 3, truncated = 0\n")
+                handle.write(
+                    f"slot      release: id  0 | task {tarea['n']} | "
+                    "stop processing: n_tokens = 3769, truncated = 0\n"
+                    '[GIN] POST     "/api/chat"\n'
+                )
             return json.dumps({
                 "message": {"content": '{"decision":"abstain","motivo":"x","evidencias":[]}'},
                 "done_reason": "stop",
-                "prompt_eval_count": 3,
-                "eval_count": 1,
+                "prompt_eval_count": 3611,
+                "eval_count": 159 if tarea["n"] == 3 else 1,
             }).encode()
 
     def urlopen(request, timeout=0):
-        enviados.append(json.loads(request.data.decode("utf-8")))
+        crudos.append(request.data)
         return Respuesta()
 
     monkeypatch.setattr(juez_contextual.urllib.request, "urlopen", urlopen)
@@ -320,18 +347,20 @@ def test_el_cliente_real_solo_cambia_el_tope_y_lee_el_log_nuevo(tmp_path, monkey
     client.digest = "digest-observado"
     pre = client.preflight("hola", ["aaaa"])
     comp = client.complete("hola", ["aaaa"])
-    assert enviados[0]["options"]["num_predict"] == 1
-    assert enviados[1]["options"]["num_predict"] == 220
-    izquierda, derecha = dict(enviados[0]), dict(enviados[1])
-    izquierda["options"] = dict(izquierda["options"])
-    derecha["options"] = dict(derecha["options"])
+    assert hashlib.sha256(crudos[0]).hexdigest() == pre["cuerpo_bytes_sha256"]
+    assert hashlib.sha256(crudos[1]).hexdigest() == comp["cuerpo_bytes_sha256"]
+    izquierda, derecha = json.loads(crudos[0]), json.loads(crudos[1])
+    assert izquierda["options"]["num_predict"] == 1
+    assert derecha["options"]["num_predict"] == 220
     izquierda["options"]["num_predict"] = None
     derecha["options"]["num_predict"] = None
     assert izquierda == derecha
-    assert "n_tokens = 1" not in pre["log_nuevo"]
-    corr = paquete_contextual.correlacionar_observacion(pre)
-    assert corr["valida"] is True and corr["n_tokens"] == 3
-    assert paquete_contextual.correlacionar_observacion(comp)["valida"] is True
+    assert paquete_contextual.correlacionar_observacion(pre)["valida"] is True
+    corr = paquete_contextual.correlacionar_observacion(comp)
+    assert corr["valida"] is True
+    assert corr["prompt_eval_count"] == 3611
+    assert corr["buffer_n_tokens"] == 3769
+    assert corr["eval_count"] == 159
 
 
 def test_la_vista_mide_el_mismo_paquete_y_juzga_una_vez(tmp_path):
@@ -359,7 +388,7 @@ def test_la_vista_mide_el_mismo_paquete_y_juzga_una_vez(tmp_path):
             if getattr(self, "mutar", False):
                 enviado = dict(enviado)
                 enviado["messages"] = [{"role": "user", "content": "prompt cambiado", "images": images}]
-            raw = json.dumps(enviado, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            raw = json.dumps(enviado).encode("utf-8")
             count = 80
             return {
                 "raw": "",
@@ -371,8 +400,13 @@ def test_la_vista_mide_el_mismo_paquete_y_juzga_una_vez(tmp_path):
                 "num_predict_enviado": 1,
                 "modelo": self.modelo,
                 "digest": self.digest,
-                "log_nuevo": f"stop processing: n_tokens = {count}, truncated = 0\n",
-                "cuerpo_sha256": hashlib.sha256(raw).hexdigest(),
+                "log_previo": "",
+                "log_nuevo": (
+                    "slot      release: id  0 | task 1 | "
+                    f"stop processing: n_tokens = {count}, truncated = 0\n"
+                    '[GIN] POST     "/api/chat"\n'
+                ),
+                "cuerpo_bytes_sha256": hashlib.sha256(raw).hexdigest(),
             }
 
         def complete(self, prompt, images):
@@ -388,7 +422,14 @@ def test_la_vista_mide_el_mismo_paquete_y_juzga_una_vez(tmp_path):
                 "num_predict": 220,
                 "modelo": self.modelo,
                 "digest": self.digest,
-                "log_nuevo": "stop processing: n_tokens = 80, truncated = 0\n",
+                "log_previo": (
+                    "slot      release: id  0 | task 1 | stop processing: n_tokens = 80, truncated = 0\n"
+                    '[GIN] POST     "/api/chat"\n'
+                ),
+                "log_nuevo": (
+                    "slot      release: id  0 | task 2 | stop processing: n_tokens = 238, truncated = 0\n"
+                    '[GIN] POST     "/api/chat"\n'
+                ),
             }
 
     words = [
@@ -440,10 +481,9 @@ def test_un_corte_fuera_de_la_fuente_no_llega_al_preflight(tmp_path):
 
 def test_el_log_no_inventa_truncated_y_la_abstencion_textual_no_llama():
     assert paquete_contextual.truncados_en_log("") == []
-    assert paquete_contextual.truncados_en_log("sin ese renglón") == []
-    linea = "slot release: stop processing: n_tokens = 4799, truncated = 0"
-    assert paquete_contextual.truncados_en_log(linea) == [{"n_tokens": 4799, "truncated": 0}]
-    assert paquete_contextual.truncados_en_log("stop processing: n_tokens = 10, truncated = 1")[0]["truncated"] == 1
+    assert paquete_contextual.truncados_en_log("stop processing: n_tokens = 10, truncated = 1") == []
+    linea = "slot      release: id  0 | task 4 | stop processing: n_tokens = 4799, truncated = 0"
+    assert paquete_contextual.truncados_en_log(linea)[0]["task"] == 4
     called = []
     result = prueba_privada.seguir_si_textual_acepto(
         {"aceptado": False, "decision": "abstencion", "abstenciones": ["se unió otra unidad"]},
@@ -452,3 +492,29 @@ def test_el_log_no_inventa_truncated_y_la_abstencion_textual_no_llama():
     assert called == []
     assert result["llamadas_semanticas"] == 0
     assert result["cliente"] == "no_llamado"
+
+
+def test_tags_discordantes_y_log_encogido_no_abren(tmp_path, monkeypatch):
+    import juez_contextual
+
+    class Respuesta:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({"models": [
+                {"name": "qwen3-vl:4b-instruct", "digest": "aaa"},
+                {"name": "qwen3-vl:4b-instruct", "digest": "bbb"},
+            ]}).encode()
+
+    monkeypatch.setattr(juez_contextual.urllib.request, "urlopen", lambda *_a, **_k: Respuesta())
+    info = juez_contextual.OllamaVision("http://127.0.0.1:9", "qwen3-vl:4b-instruct").identificar()
+    assert info["ok"] is False
+    log = tmp_path / "server.log"
+    log.write_bytes(b"abc")
+    obs = juez_contextual.ObservadorLog(log)
+    assert obs.texto_desde(10) == ""
+    assert obs.texto_hasta(10) == ""

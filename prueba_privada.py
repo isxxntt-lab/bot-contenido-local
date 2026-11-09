@@ -639,9 +639,8 @@ def _medir_paquete(package: dict, client, schema: dict) -> dict:
         return package
     images = [base64.b64encode(blob).decode("ascii") for blob in antes["imagenes"]]
     enviado = juez_contextual.cuerpo_preflight(antes["cuerpo"])
-    esperado = hashlib.sha256(
-        json.dumps(enviado, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    wire = json.dumps(enviado).encode("utf-8")
+    esperado = hashlib.sha256(wire).hexdigest()
     trace = client.preflight(antes["prompt"], images, antes["cuerpo"])
     if not isinstance(trace, dict):
         trace = {}
@@ -650,10 +649,10 @@ def _medir_paquete(package: dict, client, schema: dict) -> dict:
         package = dict(package)
         package["preflight"] = {"aplicada": False, "motivo": "la entrada cambió durante la medición"}
         return package
-    despues["cuerpo_sha256"] = esperado
-    if trace.get("cuerpo_sha256") != esperado:
+    despues["cuerpo_bytes_sha256"] = esperado
+    if trace.get("cuerpo_bytes_sha256") != esperado:
         package = dict(package)
-        package["preflight"] = {"aplicada": False, "motivo": "el transporte no envió el cuerpo construido"}
+        package["preflight"] = {"aplicada": False, "motivo": "el transporte no envió los bytes construidos"}
         return package
     return paquete_contextual.aplicar_preflight(package, trace, despues)
 
