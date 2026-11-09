@@ -420,7 +420,7 @@ def _caption(record: dict) -> str:
     )
 
 
-def evaluate_candidate(candidate, config: dict, folder: Path, cache_dir: Path) -> dict:
+def evaluate_candidate(candidate, config: dict, folder: Path, cache_dir: Path, contextual=None) -> dict:
     """Evalúa un clip de la caché. No descarga y no publica."""
     require_judge()
     folder.mkdir(parents=True, exist_ok=True)
@@ -478,8 +478,19 @@ def evaluate_candidate(candidate, config: dict, folder: Path, cache_dir: Path) -
     record["layout"] = moment.layout.kind if moment.layout else None
     if not judgement.get("aceptado"):
         record["rechazado_por"] = ["abstencion" if judgement.get("decision") == "abstencion" else "juez"]
+        record["contextual"] = {"decision": "no_llamado", "motivo": "el juez textual no aceptó; no se rescata"}
         _finish(folder, record)
         return record
+    if contextual is not None:
+        try:
+            contextual_verdict = contextual(moment, cache)
+        except Exception as exc:  # noqa: BLE001 - un fallo del runtime no aprueba el clip
+            contextual_verdict = {"decision": "abstain", "motivo": str(exc), "valido": False}
+        record["contextual"] = contextual_verdict
+        if contextual_verdict.get("decision") != "accept":
+            record["rechazado_por"] = ["contextual"]
+            _finish(folder, record)
+            return record
     try:
         rendered = folder / "render.mp4"
         clipazos.render_short(
@@ -526,6 +537,31 @@ def evaluate_candidate(candidate, config: dict, folder: Path, cache_dir: Path) -
     return record
 
 
+def _source_time(moment, cut_time: float) -> float:
+    if not moment.cuts:
+        return float(moment.start) + cut_time
+    cursor = 0.0
+    for left, right in moment.cuts:
+        span = right - left
+        if cut_time <= cursor + span:
+            return left + (cut_time - cursor)
+        cursor += span
+    return float(moment.cuts[-1][1])
+
+
+def _contextual_view(moment, video: Path, client, folder: Path) -> dict:
+    import juez_contextual
+
+    length = float(moment.length or 0)
+    points = [0.0, min(float(moment.peak or 0), max(0.0, length)), max(0.0, length - 0.05)]
+    frames = []
+    for index, cut in enumerate(points):
+        shot = juez_contextual.extract_frames(video, _source_time(moment, cut), _source_time(moment, cut) + 0.05, folder, 1)
+        if shot:
+            frames.append((cut, shot[0][1]))
+    return juez_contextual.judge_clip(moment.cues or [], 0.0, length, frames, client)
+
+
 def _finish(folder: Path, record: dict) -> None:
     (folder / "manifest.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     _write_md(folder / "evaluacion.md", record)
@@ -550,6 +586,7 @@ def run(
     max_evaluar: int = 16,
     max_exportar: int = 5,
     cache_dir: Path | None = None,
+    contextual=None,
 ) -> dict:
     """Evalúa como mucho ``max_evaluar`` cachés y exporta como mucho ``max_exportar`` aprobados."""
     require_judge()
@@ -577,7 +614,7 @@ def run(
         if judged >= max_evaluar or summary["exportados"] >= max_exportar:
             break
         folder = _fresh(salida / "candidatos", clipazos._safe_name(candidate.key))
-        record = evaluate_candidate(candidate, config, folder, cache_dir)
+        record = evaluate_candidate(candidate, config, folder, cache_dir, contextual)
         summary["evaluados"] += 1
         if (record.get("juez") or {}).get("ejecutado"):
             judged += 1
@@ -634,6 +671,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--escritorio", type=Path, default=None)
     parser.add_argument("--max-evaluar", type=int, default=16)
     parser.add_argument("--max-exportar", type=int, default=5)
+    parser.add_argument(
+        "--juez-contextual",
+        default="",
+        help="URL local del ensayo visual. Vacío: el juez contextual queda apagado.",
+    )
     args = parser.parse_args(argv)
     config = load_config(args.config)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -644,9 +686,19 @@ def main(argv: list[str] | None = None) -> int:
         escritorio = args.escritorio
     candidates = catalog(args.reportes, args.cache)
     print(f"Caché con ficha: {len(candidates)}. Salida: {salida}", flush=True)
+    contextual = None
+    if args.juez_contextual:
+        import juez_contextual
+
+        client = juez_contextual.OllamaVision(args.juez_contextual, "qwen3-vl:4b-instruct")
+
+        def contextual(moment, video, _client=client):
+            return _contextual_view(moment, video, _client, salida / "_frames")
+
     run(
         config, candidates, salida, escritorio,
         max_evaluar=args.max_evaluar, max_exportar=args.max_exportar, cache_dir=args.cache,
+        contextual=contextual,
     )
     return 0
 
