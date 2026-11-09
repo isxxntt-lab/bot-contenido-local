@@ -42,32 +42,108 @@ def require_judge() -> None:
         raise RuntimeError("clip_judge.judge no está disponible; no se genera nada")
 
 
-def code_provenance() -> dict:
-    """Commit, árbol sucio y hash de los archivos que deciden el ensayo.
+_CODE_FILES = ("prueba_privada.py", "clip_judge.py", "narrative_segments.py", "clipazos.py")
+_PRIVATE_NAME = (".env", "credencial", "token", "secret", "client_secret")
 
-    No afirma que un commit antiguo ya contuviera este runner.
-    """
-    files = ("prueba_privada.py", "clip_judge.py", "narrative_segments.py", "clipazos.py")
-    digests = {}
-    for name in files:
-        path = clipazos.BASE_DIR / name
-        digest = hashlib.sha256()
-        digest.update(path.read_bytes())
-        digests[name] = digest.hexdigest()
-    head, dirty = "", True
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _git(args: list[str]) -> subprocess.CompletedProcess | None:
     try:
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=clipazos.BASE_DIR,
-            capture_output=True, text=True, check=False,
-        ).stdout.strip()
-        porcelain = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
-            cwd=clipazos.BASE_DIR, capture_output=True, text=True, check=False,
-        ).stdout.strip()
-        dirty = bool(porcelain)
+        return subprocess.run(
+            ["git", *args], cwd=clipazos.BASE_DIR, capture_output=True, check=False,
+        )
     except OSError:
-        head = ""
-    return {"git": head, "dirty": dirty, "sha256": digests}
+        return None
+
+
+def _hide_private(path: str) -> bool:
+    folded = path.casefold()
+    return any(part in folded for part in _PRIVATE_NAME)
+
+
+def code_provenance() -> dict:
+    """Hash del código en disco y, si git responde, si ese código es el del commit.
+
+    Si git no está o el directorio no es un repo, el estado queda ``desconocido``.
+    No se declara limpio. No se listan rutas de secretos ni el árbol ignored entero.
+    """
+    digests = {name: _file_sha256(clipazos.BASE_DIR / name) for name in _CODE_FILES}
+    report: dict = {
+        "sha256": digests,
+        "git": None,
+        "git_estado": "desconocido",
+        "motivo": "",
+        "dirty": None,
+        "tracked_modificados": [],
+        "untracked": [],
+        "ignored_codigo": [],
+        "ignored_otros": None,
+        "archivos_iguales_al_commit": {},
+        "runner_en_commit": None,
+    }
+    head = _git(["rev-parse", "HEAD"])
+    if head is None or head.returncode != 0 or not head.stdout.strip():
+        detail = ""
+        if head is not None:
+            detail = (head.stderr or head.stdout).decode("utf-8", "replace").strip()
+        report["motivo"] = detail or "git no devolvió un commit"
+        return report
+    report["git"] = head.stdout.decode().strip()
+    status = _git(["status", "--porcelain=v1", "--ignored=matching", "--untracked-files=normal"])
+    if status is None or status.returncode != 0:
+        detail = ""
+        if status is not None:
+            detail = (status.stderr or status.stdout).decode("utf-8", "replace").strip()
+        report["motivo"] = detail or "git status falló"
+        return report
+    tracked: list[str] = []
+    untracked: list[str] = []
+    ignored_code: list[str] = []
+    ignored_others = 0
+    private_omitidos = 0
+    for raw in status.stdout.decode("utf-8", "replace").splitlines():
+        if len(raw) < 4:
+            continue
+        code, path = raw[:2], raw[3:].strip().strip('"')
+        if _hide_private(path):
+            private_omitidos += 1
+            continue
+        if code == "!!":
+            if Path(path).name in _CODE_FILES:
+                ignored_code.append(path)
+            else:
+                ignored_others += 1
+        elif code == "??":
+            untracked.append(path)
+        elif code.strip():
+            tracked.append(path)
+    report["tracked_modificados"] = tracked
+    report["untracked"] = untracked
+    report["ignored_codigo"] = ignored_code
+    report["ignored_otros"] = ignored_others
+    report["privados_omitidos"] = private_omitidos
+    same: dict[str, bool] = {}
+    for name in _CODE_FILES:
+        exists = _git(["cat-file", "-e", f"HEAD:{name}"])
+        diff = _git(["diff", "--quiet", "HEAD", "--", name])
+        same[name] = (
+            exists is not None and exists.returncode == 0
+            and diff is not None and diff.returncode == 0
+        )
+    report["archivos_iguales_al_commit"] = same
+    report["runner_en_commit"] = all(same.values())
+    if tracked or untracked or ignored_code or private_omitidos or not report["runner_en_commit"]:
+        report["git_estado"] = "sucio"
+        report["dirty"] = True
+    else:
+        report["git_estado"] = "limpio"
+        report["dirty"] = False
+    return report
 
 
 def judge_version(config: dict) -> dict:

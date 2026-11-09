@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import clipazos
@@ -250,3 +251,48 @@ def test_aprobado_se_copia_como_prueba_y_no_publica(tmp_path, videos, monkeypatc
     assert probed["ancho"] == 1080 and probed["alto"] == 1920 and probed["audio"] is True
     after_export = {path.name for path in (clipazos.BASE_DIR / "export_tiktok").glob("*")} if (clipazos.BASE_DIR / "export_tiktok").is_dir() else set()
     assert after_export == before_export
+
+
+def _git_repo(path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=path, check=True, capture_output=True)
+
+
+def test_sin_repo_la_procedencia_no_dice_limpio(tmp_path, monkeypatch):
+    monkeypatch.setattr(clipazos, "BASE_DIR", tmp_path)
+    for name in ("prueba_privada.py", "clip_judge.py", "narrative_segments.py", "clipazos.py"):
+        (tmp_path / name).write_bytes(b"codigo")
+    report = prueba_privada.code_provenance()
+    assert report["git_estado"] == "desconocido"
+    assert report["dirty"] is None
+    assert report["motivo"]
+    assert report["runner_en_commit"] is None
+    assert len(report["sha256"]["clip_judge.py"]) == 64
+
+
+def test_procedencia_separa_limpio_untracked_y_tracked(tmp_path, monkeypatch):
+    for name in ("prueba_privada.py", "clip_judge.py", "narrative_segments.py", "clipazos.py"):
+        (tmp_path / name).write_text("version\n", encoding="utf-8")
+    _git_repo(tmp_path)
+    subprocess.run(["git", "add", "--", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=tmp_path, check=True, capture_output=True)
+    monkeypatch.setattr(clipazos, "BASE_DIR", tmp_path)
+    clean = prueba_privada.code_provenance()
+    assert clean["git_estado"] == "limpio", clean
+    assert clean["dirty"] is False
+    assert clean["runner_en_commit"] is True
+    assert clean["untracked"] == [] and clean["tracked_modificados"] == []
+    (tmp_path / "nota_nueva.py").write_text("nueva\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("TOKEN=no-mostrar\n", encoding="utf-8")
+    dirty = prueba_privada.code_provenance()
+    assert dirty["dirty"] is True
+    assert "nota_nueva.py" in dirty["untracked"]
+    assert all(".env" not in path for path in dirty["untracked"])
+    assert dirty["privados_omitidos"] >= 1
+    (tmp_path / "clip_judge.py").write_text("cambiado\n", encoding="utf-8")
+    changed = prueba_privada.code_provenance()
+    assert any(path.endswith("clip_judge.py") for path in changed["tracked_modificados"])
+    assert changed["archivos_iguales_al_commit"]["clip_judge.py"] is False
+    assert changed["runner_en_commit"] is False
+    assert changed["sha256"]["prueba_privada.py"] == clean["sha256"]["prueba_privada.py"]

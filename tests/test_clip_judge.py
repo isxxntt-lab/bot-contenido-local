@@ -170,3 +170,62 @@ def test_intro_con_el_pico_al_principio_no_tiene_remate():
     assert not verdict.criteria["remate"]["ok"]
     assert not verdict.accepted
     assert any(item.startswith("remate:") for item in verdict.reasons)
+
+
+def test_el_nexo_sin_tilde_no_se_confunde_con_la_palabra_acentuada():
+    """Límite léxico: no es una prueba de que la frase tenga sentido."""
+    samples = {
+        "Sí.": False,
+        "Si.": True,
+        "¿Cómo?": False,
+        "Como?": True,
+        "él.": False,
+        "el.": True,
+        "por.": True,
+        "por!": True,
+        "que?": True,
+        "Y?": True,
+    }
+    for text, dangling in samples.items():
+        words = build([(text, 0.0)])
+        assert clip_judge._dangling_close(words[-1].text) is dangling, text
+    open_end = build([("todo queda resuelto", 0.0)])
+    closed_end = build([("todo queda resuelto.", 0.0)])
+    assert ns.split_sentences(open_end, 0.6, total=open_end[-1].end + 2)[-1].closed is False
+    assert ns.split_sentences(closed_end, 0.6, total=closed_end[-1].end + 0.05)[-1].closed is True
+
+
+# Ventana guardada del manifiesto 2040 de DuendePablo. No es una transcripción nueva.
+DUENDE_2040 = {
+    "start": 5.08,
+    "end": 17.84,
+    "peak": 16.75,
+    "first_word": 5,
+    "last_word": 30,
+    "complete_start": True,
+    "complete_end": True,
+    "crosses_units": True,
+    "notes": ["une frases de otra unidad narrativa para llegar al mínimo"],
+}
+
+
+def test_replay_del_segmento_guardado_de_duendepablo_se_abstiene():
+    from video_editor import CaptionCue
+    words = [
+        CaptionCue("No", 6.0, 6.2), CaptionCue("puedo", 6.3, 6.6),
+        CaptionCue("pasar", 6.7, 7.0), CaptionCue("esa", 7.1, 7.3),
+        CaptionCue("parte", 7.4, 7.8), CaptionCue("salta", 15.0, 15.4),
+        CaptionCue("parió!", 17.1, 17.49),
+    ]
+    segment = ns.Segment(
+        DUENDE_2040["start"], DUENDE_2040["end"], DUENDE_2040["peak"],
+        0, len(words) - 1,
+        complete_start=DUENDE_2040["complete_start"],
+        complete_end=DUENDE_2040["complete_end"],
+        crosses_units=DUENDE_2040["crosses_units"],
+        notes=list(DUENDE_2040["notes"]),
+    )
+    verdict = clip_judge.judge(words, segment, length=10.22, config=PROD)
+    assert verdict.decision == "abstencion", (verdict.reasons, verdict.abstentions)
+    assert verdict.criteria["cierre_colgante"]["ok"] is True
+    assert not verdict.accepted

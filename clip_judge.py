@@ -114,10 +114,13 @@ def _plain(word: str) -> str:
 
 
 def _dangling_close(text: str) -> bool:
-    """«por», «por.», «por!», «por?» o «por...» siguen siendo un final colgado.
+    """«por», «por.» o «que?» siguen colgados. «Sí.», «¿Cómo?» y «él» no.
 
-    La puntuación que añade el reconocedor no convierte una preposición en cierre.
-    Una palabra con contenido («parió!») no entra en esta lista.
+    La lista guarda la forma sin tilde (``si``, ``como``, ``el``). ``_plain``
+    conserva la tilde, así que «Sí» no es ``si`` y «él» no es ``el``. Eso no
+    prueba que la frase tenga sentido: solo separa el nexo escrito así del
+    monosílabo acentuado. Una frase de contenido sin punto tampoco se da por
+    cerrada; lo decide el segmentador, no esta lista.
     """
     return _plain(text) in DANGLING_ENDS
 
