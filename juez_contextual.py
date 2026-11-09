@@ -17,6 +17,27 @@ from pathlib import Path
 
 from video_editor import _ffmpeg_exe
 
+OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["accept", "reject", "abstain"]},
+        "motivo": {"type": "string", "maxLength": 140},
+        "evidencias": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "tipo": {"type": "string", "enum": ["inicio", "causa", "remate", "hueco"]},
+                    "palabra_i": {"type": "integer"},
+                    "t": {"type": "number"},
+                },
+                "required": ["tipo", "palabra_i", "t"],
+            },
+        },
+    },
+    "required": ["decision", "motivo", "evidencias"],
+}
 DECISIONS = ("accept", "reject", "abstain")
 EVIDENCE = ("inicio", "causa", "remate", "hueco")
 NEEDED = ("inicio", "causa", "remate")
@@ -86,6 +107,18 @@ def _abstain(reason: str) -> dict:
     return {"decision": "abstain", "motivo": reason, "evidencias": [], "valido": False}
 
 
+def build_request(model: str, prompt: str, images: list[str], num_ctx: int, keep_alive) -> dict:
+    """Cuerpo documentado de /api/chat: esquema JSON, sin streaming y con tope de salida."""
+    return {
+        "model": model,
+        "stream": False,
+        "keep_alive": keep_alive,
+        "messages": [{"role": "user", "content": prompt, "images": images}],
+        "format": OUTPUT_SCHEMA,
+        "options": {"temperature": 0, "num_ctx": num_ctx, "num_predict": 220},
+    }
+
+
 def prompt_for(coverage: dict) -> str:
     """Los textos del clip van como datos. No se le pide que obedezca lo que dicen."""
     payload = {
@@ -141,14 +174,20 @@ class OllamaVision:
         self.num_ctx = num_ctx
         self.keep_alive = keep_alive
 
-    def complete(self, prompt: str, images: list[str]) -> str:
-        body = {
-            "model": self.model,
-            "stream": False,
-            "keep_alive": self.keep_alive,
-            "messages": [{"role": "user", "content": prompt, "images": images}],
-            "format": "json",
-            "options": {"temperature": 0, "num_ctx": self.num_ctx, "num_predict": 256},
+    def complete(self, prompt: str, images: list[str]) -> dict:
+        body = build_request(self.model, prompt, images, self.num_ctx, self.keep_alive)
+        trace = {
+            "raw": "",
+            "done_reason": None,
+            "prompt_eval_count": None,
+            "eval_count": None,
+            "load_duration_ms": None,
+            "total_duration_ms": None,
+            "error": None,
+            "num_ctx": self.num_ctx,
+            "num_predict": 220,
+            "n_images": len(images),
+            "prompt_chars": len(prompt),
         }
         request = urllib.request.Request(
             self.base_url + "/api/chat",
@@ -158,12 +197,29 @@ class OllamaVision:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:500]
+            trace["error"] = f"HTTP {exc.code}: {detail}"
+            trace["done_reason"] = "http_error"
+            return trace
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
-            raise RuntimeError(f"runtime contextual: {exc}") from exc
+            trace["error"] = f"runtime contextual: {exc}"
+            trace["done_reason"] = "runtime"
+            return trace
         message = (payload.get("message") or {}).get("content")
+        trace["raw"] = message if isinstance(message, str) else ""
+        trace["done_reason"] = payload.get("done_reason")
+        trace["prompt_eval_count"] = payload.get("prompt_eval_count")
+        trace["eval_count"] = payload.get("eval_count")
+        if payload.get("load_duration") is not None:
+            trace["load_duration_ms"] = round(payload["load_duration"] / 1e6, 1)
+        if payload.get("total_duration") is not None:
+            trace["total_duration_ms"] = round(payload["total_duration"] / 1e6, 1)
         if not isinstance(message, str):
-            raise RuntimeError("runtime contextual sin texto")
-        return message
+            trace["error"] = "runtime contextual sin texto"
+        elif payload.get("done_reason") == "length":
+            trace["error"] = "salida cortada por num_predict; no se completa a mano"
+        return trace
 
 
 def judge_clip(words: list, start: float, end: float, frames: list[tuple[float, Path]], client) -> dict:
@@ -172,9 +228,24 @@ def judge_clip(words: list, start: float, end: float, frames: list[tuple[float, 
     if len(coverage["palabras"]) < 3 or len(coverage["fotogramas"]) < 2:
         return _abstain("cobertura insuficiente: faltan palabras o fotogramas del recorte")
     try:
-        raw = client.complete(prompt_for(coverage), [_image_b64(path) for _stamp, path in frames])
-    except RuntimeError as exc:
-        return _abstain(str(exc))
-    verdict = validate_decision(raw, coverage)
-    verdict["cobertura"] = {"inicio": coverage["inicio"], "fin": coverage["fin"], "fotogramas": coverage["fotogramas"]}
+        trace = client.complete(prompt_for(coverage), [_image_b64(path) for _stamp, path in frames])
+    except Exception as exc:  # noqa: BLE001 - el cliente viejo podía lanzar
+        return _abstain(f"runtime contextual: {exc}")
+    if not isinstance(trace, dict):
+        trace = {"raw": str(trace), "done_reason": None, "error": None}
+    if trace.get("error") or not trace.get("raw"):
+        verdict = _abstain(trace.get("error") or "respuesta vacía")
+    else:
+        verdict = validate_decision(trace["raw"], coverage)
+    verdict["cobertura"] = {
+        "inicio": coverage["inicio"],
+        "fin": coverage["fin"],
+        "fotogramas": coverage["fotogramas"],
+        "n_palabras": len(coverage["palabras"]),
+    }
+    verdict["traza"] = {key: trace.get(key) for key in (
+        "done_reason", "prompt_eval_count", "eval_count", "load_duration_ms",
+        "total_duration_ms", "error", "num_ctx", "num_predict", "n_images", "prompt_chars",
+    )}
+    verdict["raw"] = trace.get("raw") or ""
     return verdict

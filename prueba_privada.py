@@ -550,16 +550,36 @@ def _source_time(moment, cut_time: float) -> float:
 
 
 def _contextual_view(moment, video: Path, client, folder: Path) -> dict:
+    """Tres fotogramas de la fuente, en el reloj del corte, antes de cualquier marca.
+
+    ``video`` es el MP4 de caché, no el corto ya rotulado. Cada punto va a su
+    carpeta para que el tercer fotograma no pise a los anteriores.
+    """
     import juez_contextual
 
     length = float(moment.length or 0)
-    points = [0.0, min(float(moment.peak or 0), max(0.0, length)), max(0.0, length - 0.05)]
+    if length <= 0.05:
+        return {"decision": "abstain", "motivo": "el recorte no tiene duración", "valido": False, "evidencias": []}
+    cut_times = [0.0, length / 2, max(0.0, length - 0.05)]
     frames = []
-    for index, cut in enumerate(points):
-        shot = juez_contextual.extract_frames(video, _source_time(moment, cut), _source_time(moment, cut) + 0.05, folder, 1)
+    clock_map = []
+    for index, cut in enumerate(cut_times):
+        source_t = _source_time(moment, cut)
+        shot = juez_contextual.extract_frames(video, source_t, source_t + 0.04, folder / f"punto_{index}", 1)
         if shot:
-            frames.append((cut, shot[0][1]))
-    return juez_contextual.judge_clip(moment.cues or [], 0.0, length, frames, client)
+            frames.append((round(cut, 3), shot[0][1]))
+            clock_map.append({
+                "reloj_corte": round(cut, 3),
+                "reloj_fuente": round(source_t, 3),
+                "archivo": shot[0][1].name,
+            })
+    verdict = juez_contextual.judge_clip(moment.cues or [], 0.0, length, frames, client)
+    verdict["procedencia_fotogramas"] = {
+        "video_fuente": str(video),
+        "pack": "3 puntos (inicio, medio, fin-0.05s) del reloj del corte, leídos en la fuente",
+        "mapa": clock_map,
+    }
+    return verdict
 
 
 def _finish(folder: Path, record: dict) -> None:
@@ -674,7 +694,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--juez-contextual",
         default="",
-        help="URL local del ensayo visual. Vacío: el juez contextual queda apagado.",
+        help=(
+            "URL loopback del modelo visual en vivo (/api/chat). Vacío: apagado. "
+            "No lee un JSON de juicio ya calculado."
+        ),
     )
     args = parser.parse_args(argv)
     config = load_config(args.config)
