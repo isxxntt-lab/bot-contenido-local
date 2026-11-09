@@ -302,6 +302,17 @@ def construir_paquete(
     }
 
 
+_TRUNCADO = re.compile(r"stop processing: n_tokens = (\d+), truncated = (\d+)")
+
+
+def truncados_en_log(texto: str) -> list[dict]:
+    """Lee el renglón real del runner. Si no está, no devuelve 0."""
+    found = []
+    for tokens, flag in _TRUNCADO.findall(texto or ""):
+        found.append({"n_tokens": int(tokens), "truncated": int(flag)})
+    return found
+
+
 def cobertura_entrada(package: dict) -> dict | None:
     """Palabras de dentro, en el reloj del corte. Lo de fuera no entra en la petición."""
     words = package.get("palabras") or {}
@@ -350,6 +361,7 @@ def aplicar_preflight(package: dict, trace: dict, huella_paquete: str, huella_en
         "eval_count": trace.get("eval_count"),
         "done_reason": trace.get("done_reason"),
         "error": trace.get("error"),
+        "truncado": trace["truncated"] if isinstance(trace.get("truncated"), int) else None,
         "motivo": "",
     }
     if trace.get("raw"):
@@ -364,6 +376,10 @@ def aplicar_preflight(package: dict, trace: dict, huella_paquete: str, huella_en
         info["motivo"] = "el backend no devolvió prompt_eval_count"
     elif trace.get("num_ctx") != NUM_CTX:
         info["motivo"] = "la medición no usa el contexto congelado"
+    elif "truncated" not in trace or not isinstance(trace.get("truncated"), int):
+        info["motivo"] = "el servidor no informó truncated; la ausencia no se convierte en 0"
+    elif trace["truncated"] != 0:
+        info["motivo"] = f"el servidor informó truncated={trace['truncated']}"
     else:
         updated["presupuesto"] = presupuesto({
             "origen": "backend",
@@ -371,6 +387,8 @@ def aplicar_preflight(package: dict, trace: dict, huella_paquete: str, huella_en
             "num_ctx": NUM_CTX,
             "num_predict": NUM_PREDICT,
         })
+        updated["truncado"] = 0
+        updated["truncado_origen"] = trace.get("truncado_origen")
         info["aplicada"] = updated["presupuesto"]["estado"] == "medido"
         info["motivo"] = updated["presupuesto"]["motivo"]
     updated["preflight"] = info
@@ -396,6 +414,8 @@ def motivo_de_bloqueo(package: dict) -> str:
     pres = package["presupuesto"]
     if pres["estado"] != "medido" or pres["cabe"] is not True:
         return "abstención: presupuesto de entrada no verificado"
+    if package.get("truncado") != 0:
+        return "abstención: no hay prueba explícita de que la entrada no se truncó"
     return ""
 
 

@@ -118,10 +118,14 @@ def test_sin_medicion_de_backend_el_presupuesto_queda_desconocido():
         "num_predict": paquete_contextual.NUM_PREDICT,
     }
     plan, reason = paquete_contextual.preparar_llamada(package, measured)
+    assert plan is None and "trunc" in reason
+    con_prueba = _package()
+    con_prueba["truncado"] = 0
+    plan, reason = paquete_contextual.preparar_llamada(con_prueba, measured)
     assert reason == ""
     assert plan == paquete_contextual.frame_plan(_cuts())
     too_big = dict(measured, prompt_eval_count=paquete_contextual.NUM_CTX)
-    plan, reason = paquete_contextual.preparar_llamada(package, too_big)
+    plan, reason = paquete_contextual.preparar_llamada(con_prueba, too_big)
     assert plan is None and "presupuesto" in reason
 
 
@@ -150,7 +154,7 @@ def test_el_adaptador_no_llama_aunque_el_paquete_este_medido(tmp_path):
     assert verdict["cliente"] == "no_llamado"
     assert verdict["decision"] == "abstain"
     assert verdict["paquete"]["ensayo_hecho"] is False
-    assert "no está hecha" in verdict["motivo"]
+    assert "trunc" in verdict["motivo"]
 
 
 def test_un_filtro_con_silencio_recupera_el_mapa_sin_inventar_palabras(tmp_path):
@@ -215,10 +219,16 @@ def test_el_preflight_se_cierra_si_el_presupuesto_no_cabe_o_la_entrada_cambia():
     package = _package()
     huella = "misma"
     medido = paquete_contextual.aplicar_preflight(package, _trace(100), huella, huella)
-    assert medido["presupuesto"]["cabe"] is True
-    assert medido["ensayo_hecho"] is False
-    assert medido["preflight"]["contenido_descartado"] is True
-    grande = paquete_contextual.aplicar_preflight(package, _trace(5000), huella, huella)
+    assert medido["preflight"]["aplicada"] is False
+    assert medido["presupuesto"]["tokens_entrada"] is None
+    assert medido["truncado"] is None if "truncado" in medido else True
+    explicito = paquete_contextual.aplicar_preflight(
+        package, _trace(100, truncated=0, truncado_origen="log"), huella, huella,
+    )
+    assert explicito["presupuesto"]["cabe"] is True
+    assert explicito["truncado"] == 0
+    assert explicito["ensayo_hecho"] is False
+    grande = paquete_contextual.aplicar_preflight(package, _trace(5000, truncated=0), huella, huella)
     assert grande["presupuesto"]["cabe"] is False
     assert "presupuesto" in paquete_contextual.motivo_de_bloqueo(grande)
     distinta = paquete_contextual.aplicar_preflight(package, _trace(100), huella, "otra")
@@ -276,10 +286,20 @@ def test_la_vista_mide_el_mismo_paquete_y_no_juzga(tmp_path):
         def preflight(self, prompt, images):
             seen["prompt"] = prompt
             seen["n"] = len(images)
-            return _trace(100)
+            return _trace(100, truncated=0, truncado_origen="log")
 
         def complete(self, prompt, images):
-            seen["juzgo"] = True
+            seen["juzgo"] = seen.get("juzgo", 0) + 1
+            seen["prompt_juicio"] = prompt
+            return {
+                "raw": json.dumps({"decision": "abstain", "motivo": "stub", "evidencias": []}),
+                "done_reason": "stop",
+                "error": None,
+                "prompt_eval_count": 100,
+                "eval_count": 12,
+                "num_ctx": 5120,
+                "num_predict": 220,
+            }
 
     words = [
         CaptionCue("antes", 0.1, 0.3),
@@ -291,12 +311,13 @@ def test_la_vista_mide_el_mismo_paquete_y_no_juzga(tmp_path):
     verdict = prueba_privada._contextual_view(moment, video, Medidor(), tmp_path / "frames", duracion_fuente=10.0)
     assert seen["n"] == 3
     assert "entra" in seen["prompt"] and "despues" not in seen["prompt"]
-    assert "juzgo" not in seen
-    assert verdict["cliente"] == "preflight"
+    assert seen["juzgo"] == 1
+    assert "despues" not in seen["prompt_juicio"]
+    assert verdict["cliente"] == "juicio"
     assert verdict["decision"] == "abstain"
+    assert verdict["llamadas_semanticas"] == 1
     assert verdict["paquete"]["presupuesto"]["tokens_entrada"] == 100
-    assert verdict["paquete"]["presupuesto"]["cabe"] is True
-    assert verdict["paquete"]["ensayo_hecho"] is False
+    assert verdict["paquete"]["truncado"] == 0
     assert [item["reloj_fuente"] for item in verdict["paquete"]["fotogramas"]] == [0.5, 4.5, 8.45]
     assert all(item["sha256"] and item["materializado"] for item in verdict["paquete"]["fotogramas"])
 
@@ -316,3 +337,19 @@ def test_un_corte_fuera_de_la_fuente_no_llega_al_preflight(tmp_path):
     assert called == []
     assert verdict["cliente"] == "no_llamado"
     assert "fuente" in verdict["motivo"]
+
+
+def test_el_log_no_inventa_truncated_y_la_abstencion_textual_no_llama():
+    assert paquete_contextual.truncados_en_log("") == []
+    assert paquete_contextual.truncados_en_log("sin ese renglón") == []
+    linea = "slot release: stop processing: n_tokens = 4799, truncated = 0"
+    assert paquete_contextual.truncados_en_log(linea) == [{"n_tokens": 4799, "truncated": 0}]
+    assert paquete_contextual.truncados_en_log("stop processing: n_tokens = 10, truncated = 1")[0]["truncated"] == 1
+    called = []
+    result = prueba_privada.seguir_si_textual_acepto(
+        {"aceptado": False, "decision": "abstencion", "abstenciones": ["se unió otra unidad"]},
+        lambda: called.append(1),
+    )
+    assert called == []
+    assert result["llamadas_semanticas"] == 0
+    assert result["cliente"] == "no_llamado"

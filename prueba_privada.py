@@ -678,6 +678,10 @@ def _contextual_view(moment, video: Path, client, folder: Path, medicion=None, d
             package = _medir_paquete(package, client, juez_contextual.OUTPUT_SCHEMA)
             cliente = "preflight"
             reason = paquete_contextual.motivo_de_bloqueo(package)
+    if not reason and getattr(client, "complete", None):
+        judged = _juzgar_una_vez(package, client, juez_contextual)
+        judged["cliente"] = "juicio"
+        return judged
     if not reason:
         reason = "presupuesto medido; la evaluación narrativa no está hecha"
     return {
@@ -688,6 +692,71 @@ def _contextual_view(moment, video: Path, client, folder: Path, medicion=None, d
         "cliente": cliente,
         "paquete": package,
     }
+
+
+def _juzgar_una_vez(package: dict, client, juez_contextual) -> dict:
+    """Una llamada con la entrada ya medida. No reintenta ni cambia el prompt."""
+    import paquete_contextual
+
+    coverage = paquete_contextual.cobertura_entrada(package)
+    frames = package.get("fotogramas") or []
+    paths = [Path(item["archivo"]) for item in frames]
+    prompt = juez_contextual.prompt_for(coverage)
+    images = [juez_contextual._image_b64(path) for path in paths]
+    try:
+        trace = client.complete(prompt, images)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "decision": "abstain",
+            "motivo": f"runtime contextual: {exc}",
+            "valido": False,
+            "evidencias": [],
+            "paquete": package,
+            "llamadas_semanticas": 1,
+        }
+    if not isinstance(trace, dict):
+        trace = {"raw": str(trace), "error": None}
+    if trace.get("error") or not trace.get("raw"):
+        verdict = {
+            "decision": "abstain",
+            "motivo": trace.get("error") or "respuesta vacía",
+            "valido": False,
+            "evidencias": [],
+        }
+    else:
+        verdict = juez_contextual.validate_decision(trace["raw"], coverage)
+    verdict["raw"] = trace.get("raw") or ""
+    verdict["traza"] = {
+        key: trace.get(key)
+        for key in ("done_reason", "prompt_eval_count", "eval_count", "error", "num_ctx", "num_predict")
+    }
+    verdict["paquete"] = package
+    verdict["llamadas_semanticas"] = 1
+    verdict["cobertura_vista_por_el_modelo"] = {
+        "dentro": len(coverage["palabras"]) if coverage else 0,
+        "fuera_no_enviado": True,
+    }
+    return verdict
+
+
+def seguir_si_textual_acepto(judgement: dict, continuar) -> dict:
+    """Una abstención o un rechazo textual no llama al modelo."""
+    if not judgement.get("aceptado"):
+        kind = "abstencion" if judgement.get("decision") == "abstencion" else "rechazo"
+        return {
+            "decision": "no_llamado",
+            "cliente": "no_llamado",
+            "motivo": f"el juez textual devolvió {kind}; no se rescata",
+            "textual": {
+                "decision": judgement.get("decision"),
+                "aceptado": False,
+                "motivos": judgement.get("motivos") or [],
+                "abstenciones": judgement.get("abstenciones") or [],
+            },
+            "llamadas_preflight": 0,
+            "llamadas_semanticas": 0,
+        }
+    return continuar()
 
 
 def _finish(folder: Path, record: dict) -> None:
