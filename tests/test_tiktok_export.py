@@ -277,3 +277,67 @@ def test_export_desactivado(tmp_path, videos, monkeypatch):
     config = {**ALLOWED, "tiktok_export": {"enabled": False}}
     post = clipazos.make_short([_candidate()], config, [[("X", False)]], "T", tmp_path / "s.mp4", [])
     assert "tiktok_export" not in post and not (tmp_path / "export_tiktok").exists()
+
+
+# --- Copia a la carpeta visible (Escritorio) -----------------------------------------------
+
+
+def test_copia_la_carpeta_completa_a_la_visible(tmp_path, videos):
+    manifest = tiktok_export.export_short(short_for(videos["ok"]), {}, root=tmp_path / "exp", now=NOW)
+    visible = tmp_path / "visible" / manifest["id"]
+    assert manifest["copia_visible"] == {"estado": "ok", "carpeta": str(visible)}
+    assert sorted(p.name for p in visible.iterdir()) == ["caption.txt", "cover.jpg", "manifest.json", "video.mp4"]
+    assert (visible / "video.mp4").read_bytes() == (tmp_path / "exp" / manifest["id"] / "video.mp4").read_bytes()
+    copied = json.loads((visible / "manifest.json").read_text(encoding="utf-8"))
+    assert copied["copia_visible"]["estado"] == "ok"
+
+
+def test_fallo_de_copia_visible_no_rompe_el_export(tmp_path, videos, monkeypatch):
+    blocker = tmp_path / "soy_un_archivo"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(tiktok_export, "visible_root", lambda config=None: blocker)
+    manifest = tiktok_export.export_short(short_for(videos["ok"]), {}, root=tmp_path / "exp", now=NOW)
+    assert manifest["copia_visible"]["estado"] == "error" and manifest["copia_visible"]["motivo"]
+    folder = tmp_path / "exp" / manifest["id"]
+    assert sorted(p.name for p in folder.iterdir()) == ["caption.txt", "cover.jpg", "manifest.json", "video.mp4"]
+
+
+def test_dry_run_tambien_copia_a_la_visible(tmp_path, videos):
+    manifest = tiktok_export.export_short(short_for(videos["ok"]), {}, dry_run=True, root=tmp_path / "exp", now=NOW)
+    assert (tmp_path / "visible" / manifest["id"] / "video.mp4").is_file()
+    assert manifest["id"].endswith("_dryrun")
+
+
+def test_refresco_de_youtube_actualiza_tambien_la_copia_visible(tmp_path, videos):
+    short = short_for(videos["ok"])
+    manifest = tiktok_export.export_short(short, {}, root=tmp_path / "exp", now=NOW)
+    short.update(youtube_id="xyz", youtube_url="https://youtube.com/shorts/xyz", youtube_privacidad="public",
+                 tiktok_export={"estado": "ok", "manifest": manifest["archivos"]["manifest.json"]})
+    report = tmp_path / "reporte.json"
+    report.write_text(json.dumps({"shorts": [short]}), encoding="utf-8")
+    assert tiktok_export.refresh_youtube(report, {}) == 1
+    copied = json.loads((tmp_path / "visible" / manifest["id"] / "manifest.json").read_text(encoding="utf-8"))
+    assert copied["youtube"]["estado"] == "subido"
+
+
+def test_resolucion_de_la_carpeta_visible(tmp_path, monkeypatch):
+    resolve = tiktok_export._real_visible_root
+    desktop = tmp_path / "Escritorio"
+    assert resolve({"tiktok_export": {"carpeta_visible": "{DESKTOP}/Clipazos TikTok"}}) == desktop / "Clipazos TikTok"
+    monkeypatch.setenv("CARPETA_PRUEBA", str(tmp_path / "otra"))
+    assert resolve({"tiktok_export": {"carpeta_visible": "$CARPETA_PRUEBA/clips"}}) == tmp_path / "otra" / "clips"
+    assert resolve({"tiktok_export": {"carpeta_visible": ""}}) is None
+    assert resolve({"tiktok_export": {"carpeta_visible": None}}) is None
+    assert resolve({"tiktok_export": {"carpeta_visible": "relativa"}}) == tiktok_export.BASE_DIR / "relativa"
+
+
+def test_desactivada_no_copia(tmp_path, videos, monkeypatch):
+    monkeypatch.setattr(tiktok_export, "visible_root", tiktok_export._real_visible_root)
+    config = {"tiktok_export": {"carpeta_visible": ""}}
+    manifest = tiktok_export.export_short(short_for(videos["ok"]), config, root=tmp_path / "exp", now=NOW)
+    assert manifest["copia_visible"] == {"estado": "desactivada"}
+
+
+def test_config_real_apunta_al_escritorio():
+    config = json.loads((ROOT / "clipazos.json").read_text(encoding="utf-8"))
+    assert config["tiktok_export"]["carpeta_visible"].startswith("{DESKTOP}")

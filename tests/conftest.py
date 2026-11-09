@@ -110,7 +110,12 @@ def allowed_config(tmp_path: Path, **publication) -> dict:
 
 @pytest.fixture(autouse=True)
 def _export_tiktok_temporal(tmp_path, monkeypatch):
-    """Las pruebas nunca escriben en la carpeta export_tiktok/ real."""
+    """Las pruebas nunca escriben en export_tiktok/ ni en el Escritorio reales."""
     import tiktok_export
 
     monkeypatch.setattr(tiktok_export, "export_root", lambda config=None: tmp_path / "export_tiktok")
+    # Ni el Escritorio real: la carpeta visible también va a tmp.
+    monkeypatch.setattr(tiktok_export, "desktop_dir", lambda: tmp_path / "Escritorio")
+    real_visible = tiktok_export.visible_root
+    monkeypatch.setattr(tiktok_export, "_real_visible_root", real_visible, raising=False)
+    monkeypatch.setattr(tiktok_export, "visible_root", lambda config=None: tmp_path / "visible")

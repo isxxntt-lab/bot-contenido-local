@@ -8,6 +8,9 @@ Por cada Short que aprueban el juez (clip_judge.py) y el QA (qa.py) se crea:
         cover.jpg      portada sacada de un fotograma del propio vídeo
         manifest.json  datos del clip, del juez, del QA, de la portada y de YouTube
 
+Tras cada export correcto la carpeta se copia también a ``carpeta_visible``
+(por defecto ``{DESKTOP}\\Clipazos TikTok``, el Escritorio real del usuario).
+
 La exportación nunca bloquea la subida a YouTube: clipazos.py captura cualquier
 error, lo apunta en el reporte y sigue. Se puede usar suelto para exportar un
 Short de un reporte ya hecho:
@@ -19,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -39,6 +43,7 @@ CAPTION_LIMIT = 2200  # caracteres máximos de una descripción de TikTok
 DEFAULTS = {
     "enabled": True,
     "carpeta": "export_tiktok",
+    "carpeta_visible": "{DESKTOP}\\Clipazos TikTok",
     "hashtags_base": ["#clipazos", "#streamers", "#clipsespañol", "#fyp"],
     "max_hashtags": 10,
     "optimizar_video": True,
@@ -75,6 +80,66 @@ def settings_from(config: dict | None) -> dict:
 def export_root(config: dict | None) -> Path:
     folder = Path(str(settings_from(config)["carpeta"]))
     return folder if folder.is_absolute() else BASE_DIR / folder
+
+
+def desktop_dir() -> Path:
+    """Escritorio real del usuario (también si está en OneDrive o se llama Escritorio).
+
+    En Windows se pregunta al sistema (SHGetFolderPathW, CSIDL_DESKTOPDIRECTORY), que
+    funciona igual desde la tarea programada que corre como el mismo usuario.
+    """
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            buffer = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+            if ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buffer) == 0 and buffer.value:
+                return Path(buffer.value)
+        except Exception:  # noqa: BLE001 - se prueba con las rutas de siempre
+            pass
+    home = Path.home()
+    for candidate in (
+        home / "Desktop", home / "Escritorio",
+        home / "OneDrive" / "Desktop", home / "OneDrive" / "Escritorio",
+    ):
+        if candidate.is_dir():
+            return candidate
+    return home / "Desktop"
+
+
+def visible_root(config: dict | None) -> Path | None:
+    """Carpeta visible donde se copian los exports; None si está desactivada.
+
+    Admite {DESKTOP}, {HOME}, variables de entorno (%USERPROFILE%) y ~. Una ruta
+    relativa se toma desde la carpeta del proyecto.
+    """
+    raw = settings_from(config).get("carpeta_visible")
+    if not raw or not str(raw).strip():
+        return None
+    text = str(raw).strip()
+    if "{DESKTOP}" in text:
+        text = text.replace("{DESKTOP}", str(desktop_dir()))
+    if "{HOME}" in text:
+        text = text.replace("{HOME}", str(Path.home()))
+    path = Path(os.path.expanduser(os.path.expandvars(text)))
+    return path if path.is_absolute() else BASE_DIR / path
+
+
+def copy_to_visible(folder: Path, config: dict | None) -> dict:
+    """Copia la carpeta del export a la carpeta visible. Nunca lanza: devuelve el resultado."""
+    try:
+        root = visible_root(config)
+        if root is None:
+            return {"estado": "desactivada"}
+        target = root / folder.name
+        target.mkdir(parents=True, exist_ok=True)
+        for item in folder.iterdir():
+            if item.is_file():
+                shutil.copy2(item, target / item.name)
+        return {"estado": "ok", "carpeta": str(target)}
+    except Exception as exc:  # noqa: BLE001 - la copia visible es solo una comodidad
+        return {"estado": "error", "motivo": str(exc)}
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +576,24 @@ def export_short(
         "subido_a_tiktok": False,
     }
     paths["manifest.json"].write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    manifest["copia_visible"] = copy_to_visible(folder, config)
+    _write_manifest(paths["manifest.json"], manifest)
+    if manifest["copia_visible"].get("estado") == "error":
+        print(f"  Aviso: no se pudo copiar a la carpeta visible ({manifest['copia_visible']['motivo']})", file=sys.stderr)
     return manifest
+
+
+def _write_manifest(path: Path, manifest: dict) -> None:
+    """Escribe el manifest en export_tiktok/ y, si hay copia visible, también allí."""
+    text = json.dumps(manifest, ensure_ascii=False, indent=2)
+    path.write_text(text, encoding="utf-8")
+    visible = manifest.get("copia_visible") or {}
+    if visible.get("estado") == "ok":
+        try:
+            (Path(visible["carpeta"]) / path.name).write_text(text, encoding="utf-8")
+        except OSError as exc:
+            visible.update(estado="error", motivo=f"no se pudo actualizar el manifest visible ({exc})")
+            path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def refresh_youtube(report_path: Path, config: dict | None, dry_run: bool = False) -> int:
@@ -529,7 +611,7 @@ def refresh_youtube(report_path: Path, config: dict | None, dry_run: bool = Fals
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["youtube"] = youtube_status(short, config, dry_run)
-            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            _write_manifest(manifest_path, manifest)
             updated += 1
         except (OSError, ValueError):
             continue

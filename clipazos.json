@@ -115,6 +115,7 @@
   "tiktok_export": {
     "enabled": true,
     "carpeta": "export_tiktok",
+    "carpeta_visible": "{DESKTOP}\\Clipazos TikTok",
     "hashtags_base": ["#clipazos", "#streamers", "#clipsespañol", "#fyp"],
     "max_hashtags": 10,
     "optimizar_video": true,

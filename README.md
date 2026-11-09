@@ -140,8 +140,17 @@ acaba en `_dryrun`). No se sube nada a TikTok:
   rutas y estado de YouTube (subido, bloqueado por derechos o por la guardia,
   pendiente o dry-run). Tras la subida se actualiza con el estado real.
 
+Además, cada export correcto (también con `--dry-run`) se copia entero a la
+carpeta visible `carpeta_visible`, por defecto `{DESKTOP}\\Clipazos TikTok`: el
+Escritorio real del usuario, que se pregunta a Windows al ejecutar (vale aunque esté
+en OneDrive y también desde la tarea programada). En este PC queda en
+`C:\Users\pc\Desktop\Clipazos TikTok\<misma carpeta>\`. Admite también `%VARIABLES%`,
+`~` o una ruta fija; vacío la desactiva. Si la copia falla se apunta en
+`copia_visible` del manifest y no afecta al export ni a YouTube. No se borra nada de
+`export_tiktok/`.
+
 Un fallo de exportación se apunta en el reporte (`tiktok_export`) y no frena la
-subida a YouTube. Config en el bloque `tiktok_export` (`enabled`, `carpeta`,
+subida a YouTube. Config en el bloque `tiktok_export` (`enabled`, `carpeta`, `carpeta_visible`,
 `hashtags_base`, `max_hashtags`, `optimizar_video`, `portada_muestras`,
 `portada_ventana_segundos`, `timeout_segundos`). Para exportar un reporte ya hecho:
 `.\.venv\Scripts\python.exe tiktok_export.py output\clipazos\reporte_AAAAMMDD.json`.
