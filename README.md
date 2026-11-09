@@ -12,6 +12,8 @@ activado, sube el resultado a YouTube Shorts.
   `assets/models/` y monta el Short con FFmpeg.
 - `video_editor.py`: utilidades comunes de subtítulos ASS y FFmpeg.
 - `youtube_upload.py`: subida a YouTube con la API oficial (OAuth).
+- `narrative_segments.py`: divide la transcripción en frases y unidades narrativas.
+- `clip_judge.py`: juez local que puntúa si un momento tiene arco completo.
 - `rights.py`: política de derechos (qué streamers y fuentes se pueden usar).
 - `qa.py`: control de calidad bloqueante del vídeo montado.
 - `publication_guard.py`: kill switch, cupos y duplicados de YouTube (SQLite).
@@ -65,6 +67,56 @@ YouTube ni gasta cupo en la base. Los archivos llevan el sufijo `_dryrun`
 los de verdad, y no cuentan para «no repetir streamer». El radar sí se actualiza.
 `youtube_upload.py --dry-run` repite las comprobaciones sobre un reporte ya hecho
 sin tocar el reporte ni la base.
+
+## Selección de momentos
+
+Cada Short es **un solo momento completo** por defecto (`seleccion.max_momentos: 1`).
+Para cada clip candidato:
+
+1. Se transcribe con faster-whisper (tiempos por palabra) y se localiza el pico
+   (salto de sonido + palabras de reacción).
+2. `narrative_segments.py` agrupa las palabras en frases (puntuación final o pausa
+   de `pausa_frase` s) y en unidades narrativas (frases sin una pausa de
+   `pausa_unidad` s entre medias). El tramo parte de la frase del pico y suma
+   frases enteras hasta tener `preparacion_segundos` antes del pico y
+   `remate_segundos` después, sin salir de la unidad y entre `segundos_min` y
+   `segundos_max`. Una frase cortada por el borde del clip no se usa para
+   rellenar, y los bordes caen siempre entre palabras.
+3. Se quitan silencios solo entre frases (tras un punto, o si duran más del doble
+   de `silencio_corte`), dejando `silencio_margen` s de respiro.
+4. `clip_judge.py` puntúa el tramo de 0 a 1 y lo acepta o lo descarta.
+
+Se prueban como mucho `candidatos_a_evaluar` clips por Short (cada uno se descarga
+y se transcribe) y se queda el primero que aprueba el juez. Si ninguno lo aprueba,
+ese Short no se hace.
+
+### Juez local (`clip_judge.py`)
+
+Sin LLM ni red. Cada criterio da de 0 a 1 punto con un motivo:
+
+| Criterio | Peso | Qué mira |
+| --- | --- | --- |
+| `hook` | 0,2 | Voz desde el primer segundo y al menos `hook_palabras_min` palabras en los primeros `hook_segundos`. |
+| `inicio_completo` | 0,2 | Empieza al inicio de una frase, no con la voz del clip ya en marcha. |
+| `final_completo` | 0,2 | Acaba al cerrar una frase, no cortado por el final del clip. |
+| `remate` | 0,2 | Tras el pico quedan al menos `remate_min_segundos` y alguna palabra. |
+| `autocontencion` | 0,1 | No empieza con «y/pero/porque...», no acaba colgando en «de/que/el...», tiene `min_palabras`. |
+| `duracion` | 0,1 | La duración final está entre `segundos_min` y `segundos_max`. |
+
+Se descarta si falla un criterio de `juez.obligatorios` (por defecto inicio, final,
+remate y duración) o si la puntuación baja de `juez.puntuacion_min` (0,6). Cada
+momento evaluado queda en el reporte: en `"seleccion"` del Short y en
+`"seleccion"` del reporte (puntuación, criterios, motivos y estado `aceptado`,
+`descartado`, `no_unido` o `error`).
+
+### Varios momentos
+
+Con `max_momentos` mayor que 1 (o `--clips N`), solo se unen momentos de la misma
+historia: el mismo clip, o el mismo streamer y el mismo directo con el segundo
+justo a continuación del primero (hueco de como mucho `union_max_hueco_segundos`
+entre la última palabra de uno y la primera del otro). Si no, se usa uno solo.
+`segundos_objetivo` solo limita la suma en ese caso; `clips_maximos`,
+`segundos_min_clip` y `segundos_max_clip` ya no deciden la selección.
 
 ## Seguridad de publicación
 
@@ -163,6 +215,14 @@ Usan vídeos sintéticos generados con FFmpeg y una API de YouTube simulada: no
 descargan clips, no necesitan credenciales y no publican nada.
 
 ## Limitaciones
+
+- La selección nueva no se ha probado todavía con clips reales: solo con
+  transcripciones sintéticas. Conviene revisar los primeros Shorts y el bloque
+  `"seleccion"` del reporte antes de ajustar umbrales.
+- El juez es una heurística sobre la transcripción: no entiende el chiste ni si el
+  momento tiene gracia. Un clip sin voz (solo juego o música) se descarta.
+- Al ser un solo momento, habrá Shorts más cortos que antes y días sin Short si
+  ningún candidato tiene arco completo.
 
 - Los permisos de `rights.streamers` los pones tú; el programa no verifica
   licencias ni detecta música con derechos dentro del audio.

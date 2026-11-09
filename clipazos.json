@@ -87,5 +87,29 @@
       "min_fotogramas_con_cara": 1,
       "puntuacion_min": 0.7
     }
+  },
+  "seleccion": {
+    "max_momentos": 1,
+    "candidatos_a_evaluar": 4,
+    "segundos_min": 10,
+    "segundos_max": 45,
+    "preparacion_segundos": 3.0,
+    "remate_segundos": 2.0,
+    "pausa_frase": 0.6,
+    "pausa_unidad": 1.5,
+    "margen_inicio": 0.15,
+    "margen_final": 0.35,
+    "silencio_corte": 1.0,
+    "silencio_margen": 0.3,
+    "union_max_hueco_segundos": 5.0,
+    "borde_clip_segundos": 0.3,
+    "juez": {
+      "puntuacion_min": 0.6,
+      "hook_segundos": 3.0,
+      "hook_palabras_min": 3,
+      "remate_min_segundos": 1.0,
+      "min_palabras": 6,
+      "obligatorios": ["inicio_completo", "final_completo", "remate", "duracion"]
+    }
   }
 }

@@ -12,6 +12,10 @@ Flujo 100 % local y sin claves:
   5. FFmpeg monta el vertical: fondo desenfocado, clip centrado, título, crédito
      del streamer y subtítulos con la palabra activa en amarillo.
 
+Selección (narrative_segments.py y clip_judge.py): por defecto un solo momento
+completo por Short, cortado en frases enteras con la preparación antes del pico
+y el remate después; el juez local descarta los tramos sin arco completo.
+
 Antes de descargar o editar un clip se comprueban los derechos (rights.py); después
 del montaje, el QA bloqueante (qa.py); y antes de subir, la guardia de publicación
 (publication_guard.py: kill switch, cupos y duplicados). --dry-run hace todo menos
@@ -36,6 +40,8 @@ from pathlib import Path
 
 import numpy as np
 
+import clip_judge
+import narrative_segments
 import publication_guard
 import qa
 import rights
@@ -64,6 +70,8 @@ CACHE_DAYS = 3
 # Sufijo de los archivos de una ejecución --dry-run, para no pisar los de verdad.
 DRY_RUN_SUFFIX = "_dryrun"
 _RUN_SUFFIX = ""
+# Momentos evaluados por el juez en esta ejecución (se guardan en el reporte).
+_SELECTION_LOG: list[dict] = []
 
 SAMPLE_RATE = 16_000
 FRAME_STEP = 0.25
@@ -136,6 +144,8 @@ class Moment:
     peak: float = 0.0
     layout: Layout | None = None
     cuts: list[tuple[float, float]] = field(default_factory=list)
+    segment: dict | None = None
+    judgement: dict | None = None
 
 
 @dataclass
@@ -663,6 +673,12 @@ def _cut_points(cues: list[CaptionCue], total: float) -> tuple[list[float], list
     return starts, ends
 
 
+def find_peak(audio: np.ndarray, cues: list[CaptionCue]) -> float:
+    """Segundo del clip con el salto de sonido más fuerte, pesado por la reacción."""
+    _energy, spike, heat = _frame_scores(audio, cues)
+    return int(np.argmax(spike * (0.35 + heat))) * FRAME_STEP
+
+
 def choose_window(
     audio: np.ndarray, cues: list[CaptionCue], shortest: float, longest: float
 ) -> tuple[float, float, float]:
@@ -780,29 +796,48 @@ def detect_layout(path: Path, start: float, length: float) -> Layout:
     return Layout("blur", aspect)
 
 
-def _keep_ranges(span: float, cues: list[CaptionCue]) -> list[tuple[float, float]]:
-    """Quita los silencios largos y deja un respiro corto, como un jump cut."""
+def _keep_ranges(
+    span: float,
+    cues: list[CaptionCue],
+    cut: float = SILENCE_CUT,
+    keep: float = SILENCE_KEEP,
+    sentence_only: bool = False,
+) -> list[tuple[float, float]]:
+    """Quita los silencios largos y deja un respiro corto, como un jump cut.
+
+    Con sentence_only=True solo corta entre frases: tras una palabra con
+    puntuación final, o si el silencio es el doble de ``cut``. Una pausa dentro
+    de una frase se respeta.
+    """
     if not cues:
         return [(0.0, span)]
     ranges: list[tuple[float, float]] = []
     cursor = 0.0
+    previous_text = ""
     for cue in cues:
         gap = cue.start - cursor
         word_end = min(span, cue.end)
-        if gap > SILENCE_CUT:
+        boundary = (
+            not sentence_only
+            or not ranges
+            or previous_text.rstrip().endswith(narrative_segments.SENTENCE_END)
+            or gap > 2 * cut
+        )
+        previous_text = cue.text
+        if gap > cut and boundary:
             if ranges:
                 left, right = ranges[-1]
-                ranges[-1] = (left, min(span, right + SILENCE_KEEP))
-            ranges.append((max(0.0, cue.start - SILENCE_KEEP), word_end))
+                ranges[-1] = (left, min(span, right + keep))
+            ranges.append((max(0.0, cue.start - keep), word_end))
         elif not ranges:
             ranges.append((0.0, word_end))
         else:
             left, _right = ranges[-1]
             ranges[-1] = (left, word_end)
         cursor = word_end
-    if ranges and span - cursor > SILENCE_CUT:
+    if ranges and span - cursor > cut:
         left, right = ranges[-1]
-        ranges[-1] = (left, min(span, right + SILENCE_KEEP))
+        ranges[-1] = (left, min(span, right + keep))
     elif ranges:
         left, _right = ranges[-1]
         ranges[-1] = (left, span)
@@ -821,10 +856,20 @@ def _place(moment: float, ranges: list[tuple[float, float]]) -> float:
 
 
 def _tighten(
-    start: float, span: float, cues: list[CaptionCue], peak: float
+    start: float,
+    span: float,
+    cues: list[CaptionCue],
+    peak: float,
+    cut: float = SILENCE_CUT,
+    keep: float = SILENCE_KEEP,
+    sentence_only: bool = False,
 ) -> tuple[float, list[CaptionCue], float, list[tuple[float, float]]]:
-    """Corta el silencio como auto-editor: se queda la voz y 0,2 s de margen."""
-    ranges = _keep_ranges(span, cues)
+    """Corta el silencio como auto-editor: se queda la voz y un margen corto.
+
+    build_moment lo llama con sentence_only=True y los valores de "seleccion"
+    (silencio_corte, silencio_margen) para no cortar a mitad de frase.
+    """
+    ranges = _keep_ranges(span, cues, cut, keep, sentence_only)
     edited = [
         CaptionCue(cue.text, _place(cue.start, ranges), max(_place(cue.end, ranges), _place(cue.start, ranges) + 0.08))
         for cue in cues
@@ -834,45 +879,161 @@ def _tighten(
     return length, edited, min(_place(peak, ranges), max(0.0, length - 0.05)), cuts
 
 
-def build_moment(candidate: Candidate, shortest: float, longest: float, language: str) -> Moment:
-    path = fetch_media(candidate)
-    audio = load_audio(path)
-    if audio.size == 0:
-        raise RuntimeError("el clip no tiene audio")
-    words = transcribe(audio, language)
-    start, span, peak = choose_window(audio, words, shortest, longest)
+def select_segment(
+    audio: np.ndarray, words: list[CaptionCue], config: dict
+) -> tuple[narrative_segments.Segment, float, list[CaptionCue], float, list[tuple[float, float]], clip_judge.Judgement]:
+    """Tramo narrativo alrededor del pico, silencios entre frases quitados y nota del juez.
+
+    Devuelve (segmento, duración final, subtítulos, pico relativo, cortes, juicio).
+    """
+    selection = narrative_segments.settings_from(config)
+    total = len(audio) / SAMPLE_RATE
+    peak = find_peak(audio, words)
+    if words:
+        segment = narrative_segments.segment_for_peak(words, peak, selection, total)
+    else:
+        # Sin voz: la ventana de siempre; el juez la descartará por no tener frases.
+        start, span, local_peak = choose_window(audio, words, selection["segundos_min"], selection["segundos_max"])
+        segment = narrative_segments.Segment(start, start + span, start + local_peak, None, None, notes=["sin transcripción"])
+    start, span = segment.start, segment.length
     cues = [
         CaptionCue(cue.text, cue.start - start, min(cue.end, start + span) - start)
         for cue in words
         if start <= cue.start < start + span
     ]
-    length, cues, peak, cuts = _tighten(start, span, cues, peak)
-    return Moment(candidate, path, start, length, cues, peak, detect_layout(path, start, span), cuts)
+    length, cues, rel_peak, cuts = _tighten(
+        start, span, cues, max(0.0, segment.peak - start),
+        selection["silencio_corte"], selection["silencio_margen"], sentence_only=True,
+    )
+    judgement = clip_judge.judge(words, segment, length, config)
+    return segment, length, cues, rel_peak, cuts, judgement
+
+
+def build_moment(
+    candidate: Candidate, shortest: float, longest: float, language: str, config: dict | None = None
+) -> Moment:
+    path = fetch_media(candidate)
+    audio = load_audio(path)
+    if audio.size == 0:
+        raise RuntimeError("el clip no tiene audio")
+    words = transcribe(audio, language)
+    if config is None:
+        # Camino antiguo (sin config): ventana por picos.
+        start, span, peak = choose_window(audio, words, shortest, longest)
+        cues = [
+            CaptionCue(cue.text, cue.start - start, min(cue.end, start + span) - start)
+            for cue in words
+            if start <= cue.start < start + span
+        ]
+        length, cues, peak, cuts = _tighten(start, span, cues, peak)
+        return Moment(candidate, path, start, length, cues, peak, detect_layout(path, start, span), cuts)
+    segment, length, cues, peak, cuts, judgement = select_segment(audio, words, config)
+    moment = Moment(candidate, path, segment.start, length, cues, peak, None, cuts)
+    moment.segment = segment.to_dict()
+    moment.judgement = judgement.to_dict()
+    if judgement.accepted:
+        moment.layout = detect_layout(path, segment.start, segment.length)
+    return moment
+
+
+def same_story(first: Moment, second: Moment, config: dict) -> tuple[bool, str]:
+    """Dos momentos solo se unen si son la misma historia.
+
+    Mismo clip, o mismo streamer y mismo VOD con el segundo justo a continuación
+    del primero (hueco entre la última palabra de uno y la primera del otro de
+    como mucho union_max_hueco_segundos).
+    """
+    a, b = first.candidate, second.candidate
+    if a.key == b.key:
+        return True, "mismo clip"
+    if a.streamer.casefold() != b.streamer.casefold():
+        return False, "otro streamer"
+    if not (a.vod_id and b.vod_id and a.vod_id == b.vod_id and a.offset is not None and b.offset is not None):
+        return False, "no se puede comprobar que sean del mismo directo"
+    seg_a, seg_b = first.segment or {}, second.segment or {}
+    end_a = a.offset + float(seg_a.get("last_word_end") or (first.start + first.length))
+    start_b = b.offset + float(seg_b.get("first_word_start") or second.start)
+    gap = start_b - end_a
+    limit = narrative_segments.settings_from(config)["union_max_hueco_segundos"]
+    if -0.5 <= gap <= limit:
+        return True, f"mismo directo, seguido ({gap:.1f} s de hueco)"
+    return False, f"mismo directo pero no seguido ({gap:.1f} s de hueco)"
+
+
+def _log_moment(candidate: Candidate, moment: Moment | None, status: str, reason: str = "") -> dict:
+    judgement = (moment.judgement if moment else None) or {}
+    entry = {
+        "clip": candidate.key,
+        "streamer": candidate.streamer,
+        "plataforma": candidate.platform,
+        "titulo": candidate.title,
+        "estado": status,
+        "aceptado": status == "aceptado",
+        "puntuacion": judgement.get("puntuacion"),
+        "motivos": judgement.get("motivos", []) + ([reason] if reason else []),
+        "criterios": judgement.get("criterios", {}),
+    }
+    if moment is not None and moment.segment:
+        entry["tramo"] = {
+            "inicio": round(moment.start, 2),
+            "fin": round(moment.segment["end"], 2),
+            "duracion_final": round(moment.length, 2),
+            "notas": moment.segment.get("notes", []),
+        }
+    _SELECTION_LOG.append(entry)
+    return entry
 
 
 def collect_moments(
     candidates: list[Candidate], config: dict, language: str
 ) -> list[Moment]:
-    """Momentos de duración natural hasta llegar a la duración objetivo del Short."""
-    limit = int(config.get("clips_maximos", 5))
+    """Por defecto, el primer momento completo que apruebe el juez.
+
+    Se evalúan como mucho seleccion.candidatos_a_evaluar clips (cada uno se
+    descarga y se transcribe). Si seleccion.max_momentos > 1, solo se añaden
+    momentos de la misma historia (same_story) hasta segundos_objetivo.
+    """
+    selection = narrative_segments.settings_from(config)
+    limit = selection["max_momentos"]
+    budget = selection["candidatos_a_evaluar"]
     target = float(config.get("segundos_objetivo", 40))
-    shortest = float(config.get("segundos_min_clip", 6))
-    longest = float(config.get("segundos_max_clip", 22))
+    shortest = selection["segundos_min"]
+    longest = selection["segundos_max"]
     moments: list[Moment] = []
     total = 0.0
+    tried = 0
     for candidate in candidates:
-        if len(moments) >= limit or total >= target - 3:
+        if len(moments) >= limit or tried >= budget:
             break
-        room = max(shortest, min(longest, target - total + 6))
+        if moments and total >= target - 3:
+            break
         decision = rights.check_candidate(candidate, config)
         if not decision.allowed:
             print(f"  Salto @{candidate.streamer} ({candidate.platform}) por derechos: {decision.reason}", file=sys.stderr)
             continue
+        tried += 1
         try:
-            moment = build_moment(candidate, shortest, room, language)
+            moment = build_moment(candidate, shortest, longest, language, config)
         except Exception as exc:  # noqa: BLE001 - un clip roto no debe parar el vídeo
             print(f"  Salto @{candidate.streamer} ({candidate.platform}): {exc}", file=sys.stderr)
+            _log_moment(candidate, None, "error", str(exc))
             continue
+        verdict = moment.judgement or {}
+        if not verdict.get("aceptado", True):
+            print(
+                f"  Descartado @{candidate.streamer} ({verdict.get('puntuacion')}): "
+                f"{'; '.join(verdict.get('motivos', []))}",
+                file=sys.stderr,
+            )
+            _log_moment(candidate, moment, "descartado")
+            continue
+        if moments:
+            joined, why = same_story(moments[-1], moment, config)
+            if not joined:
+                print(f"  No se une @{candidate.streamer}: {why} (otra historia)", file=sys.stderr)
+                _log_moment(candidate, moment, "no_unido", f"otra historia: {why}")
+                continue
+        _log_moment(candidate, moment, "aceptado")
         moments.append(moment)
         total += moment.length
         chat = f", chat {candidate.chat_rate:.0f}/s" if candidate.chat_rate else ""
@@ -1130,9 +1291,10 @@ def make_short(
     destination: Path,
     extra_tags: list[str],
 ) -> dict | None:
+    first_log = len(_SELECTION_LOG)
     moments = collect_moments(candidates, config, config.get("idioma", "es"))
-    if len(moments) < 2:
-        print("  No hay clips suficientes para este Short.", file=sys.stderr)
+    if not moments:
+        print("  Ningún momento completo para este Short.", file=sys.stderr)
         return None
     render_short(moments, title, config.get("canal", "Clipazos ES"), destination)
     post = post_text(moments, headline, extra_tags)
@@ -1141,6 +1303,7 @@ def make_short(
     unique = list({moment.candidate.key: moment.candidate for moment in moments}.values())
     post["clips"] = [candidate.key for candidate in unique]
     post["fuentes"] = [rights.source_info(candidate) for candidate in unique]
+    post["seleccion"] = _SELECTION_LOG[first_log:]
     print(f"  Vídeo: {destination} ({post['duracion']}s, {destination.stat().st_size} bytes)")
     result = qa.run_qa(destination, config, destination.with_suffix(".ass"))
     post["qa"] = result.to_dict()
@@ -1159,7 +1322,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--solo-radar", action="store_true", help="Busca y actualiza el radar sin montar vídeos.")
     parser.add_argument("--sin-hype", action="store_true", help="No monta el Short especial de juego en hype.")
     parser.add_argument("--streamer", help="Short con los mejores clips de un solo streamer.")
-    parser.add_argument("--clips", type=int, help="Máximo de clips por vídeo (clips_maximos).")
+    parser.add_argument(
+        "--clips", type=int,
+        help="Máximo de momentos por vídeo (seleccion.max_momentos); solo se unen si son la misma historia.",
+    )
     parser.add_argument("--segundos", type=float, help="Duración objetivo del Short (segundos_objetivo).")
     parser.add_argument("--forzar", action="store_true", help="Rehace los Shorts aunque ya estén hechos hoy.")
     parser.add_argument(
@@ -1275,6 +1441,7 @@ def _upload(
 def main(argv: list[str] | None = None) -> int:
     global _RUN_SUFFIX
     _utf8_stdio()
+    _SELECTION_LOG.clear()
     args = parse_args(argv)
     config = load_config(args.config)
     _RUN_SUFFIX = DRY_RUN_SUFFIX if args.dry_run else ""
@@ -1282,6 +1449,8 @@ def main(argv: list[str] | None = None) -> int:
         print("Modo --dry-run: no se llamará a la API de YouTube.")
     if args.clips:
         config["clips_maximos"] = args.clips
+        selection = config.get("seleccion") if isinstance(config.get("seleccion"), dict) else {}
+        config["seleccion"] = {**selection, "max_momentos": args.clips}
     if args.segundos:
         config["segundos_objetivo"] = args.segundos
     channel = config.get("canal", "Clipazos ES")
@@ -1330,6 +1499,7 @@ def main(argv: list[str] | None = None) -> int:
         "hype": [{"juego": game, "vistas": views, "media": round(baseline)} for game, views, baseline in hot],
         "subiendo": [{"streamer": name, "vistas": views, "media": round(baseline)} for name, views, baseline in rising],
         "shorts": [],
+        "seleccion": _SELECTION_LOG,
     }
     if args.streamer:
         pool = streamer_pool(twitch + kick + youtube, args.streamer)
