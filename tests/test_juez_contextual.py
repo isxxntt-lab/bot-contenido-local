@@ -140,39 +140,23 @@ def test_el_contextual_puede_vetar_un_accept_textual(tmp_path, monkeypatch):
     assert not (tmp_path / "out" / "PRUEBA_NO_PUBLICAR.mp4").exists()
 
 
-def test_la_vista_llama_al_cliente_sobre_la_fuente(tmp_path):
+def test_la_vista_no_llama_al_cliente_sin_asr_original(tmp_path):
     from types import SimpleNamespace
-    import subprocess
-    from video_editor import _ffmpeg_exe
 
-    video = tmp_path / "fuente.mp4"
-    subprocess.run(
-        [_ffmpeg_exe(), "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=blue:s=160x90:d=12",
-         "-t", "12", str(video)],
-        check=True,
-    )
-    seen = {}
+    called = []
 
     class Cliente:
         def complete(self, prompt, images):
-            seen["prompt"] = prompt
-            seen["n"] = len(images)
-            return {
-                "raw": _accept(),
-                "done_reason": "stop",
-                "error": None,
-                "prompt_eval_count": 10,
-                "eval_count": 20,
-            }
+            called.append(prompt)
+            return {"raw": _accept(), "done_reason": "stop", "error": None}
 
     moment = SimpleNamespace(length=8.0, start=1.5, cuts=[], cues=_words())
-    verdict = prueba_privada._contextual_view(moment, video, Cliente(), tmp_path / "frames")
-    assert seen["n"] == 3
-    assert "DATOS" in seen["prompt"]
-    assert verdict["decision"] == "accept"
-    assert [item["reloj_corte"] for item in verdict["procedencia_fotogramas"]["mapa"]] == [0.0, 4.0, 7.95]
-    assert [item["reloj_fuente"] for item in verdict["procedencia_fotogramas"]["mapa"]] == [1.5, 5.5, 9.45]
-    assert verdict["procedencia_fotogramas"]["video_fuente"].endswith("fuente.mp4")
+    verdict = prueba_privada._contextual_view(moment, tmp_path / "fuente.mp4", Cliente(), tmp_path / "frames")
+    assert called == []
+    assert verdict["cliente"] == "no_llamado"
+    assert verdict["decision"] == "abstain"
+    assert "ASR" in verdict["motivo"]
+    assert verdict["paquete"]["ass_es_asr_original"] is False
 
 
 def test_el_flag_vacio_no_construye_cliente_y_el_url_si(monkeypatch, tmp_path):

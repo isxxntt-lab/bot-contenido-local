@@ -537,49 +537,35 @@ def evaluate_candidate(candidate, config: dict, folder: Path, cache_dir: Path, c
     return record
 
 
-def _source_time(moment, cut_time: float) -> float:
-    if not moment.cuts:
-        return float(moment.start) + cut_time
-    cursor = 0.0
-    for left, right in moment.cuts:
-        span = right - left
-        if cut_time <= cursor + span:
-            return left + (cut_time - cursor)
-        cursor += span
-    return float(moment.cuts[-1][1])
+def plan_contextual(cuts):
+    """La misma receta de tres fotogramas que usa el ensayo."""
+    import paquete_contextual
+
+    return paquete_contextual.frame_plan(cuts)
 
 
-def _contextual_view(moment, video: Path, client, folder: Path) -> dict:
-    """Tres fotogramas de la fuente, en el reloj del corte, antes de cualquier marca.
+def _contextual_view(moment, video: Path, client, folder: Path, medicion=None, duracion_fuente: float | None = None) -> dict:
+    """Arma el paquete compartido y no llama al modelo.
 
-    ``video`` es el MP4 de caché, no el corto ya rotulado. Cada punto va a su
-    carpeta para que el tercer fotograma no pise a los anteriores.
+    El cliente y la carpeta de fotogramas quedan sin usar hasta una evaluación
+    futura que mida el presupuesto sobre este paquete. Los subtítulos del corto
+    no sustituyen al ASR de origen.
     """
-    import juez_contextual
+    import paquete_contextual
 
-    length = float(moment.length or 0)
-    if length <= 0.05:
-        return {"decision": "abstain", "motivo": "el recorte no tiene duración", "valido": False, "evidencias": []}
-    cut_times = [0.0, length / 2, max(0.0, length - 0.05)]
-    frames = []
-    clock_map = []
-    for index, cut in enumerate(cut_times):
-        source_t = _source_time(moment, cut)
-        shot = juez_contextual.extract_frames(video, source_t, source_t + 0.04, folder / f"punto_{index}", 1)
-        if shot:
-            frames.append((round(cut, 3), shot[0][1]))
-            clock_map.append({
-                "reloj_corte": round(cut, 3),
-                "reloj_fuente": round(source_t, 3),
-                "archivo": shot[0][1].name,
-            })
-    verdict = juez_contextual.judge_clip(moment.cues or [], 0.0, length, frames, client)
-    verdict["procedencia_fotogramas"] = {
-        "video_fuente": str(video),
-        "pack": "3 puntos (inicio, medio, fin-0.05s) del reloj del corte, leídos en la fuente",
-        "mapa": clock_map,
+    del client, folder
+    package = paquete_contextual.paquete_de_momento(
+        moment, video, duracion_fuente=duracion_fuente, medicion=medicion,
+    )
+    reason = paquete_contextual.motivo_de_bloqueo(package)
+    return {
+        "decision": "abstain",
+        "motivo": reason or "paquete completo; la evaluación con el modelo no está hecha",
+        "valido": False,
+        "evidencias": [],
+        "cliente": "no_llamado",
+        "paquete": package,
     }
-    return verdict
 
 
 def _finish(folder: Path, record: dict) -> None:

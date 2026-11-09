@@ -147,6 +147,7 @@ class Moment:
     cuts: list[tuple[float, float]] = field(default_factory=list)
     segment: dict | None = None
     judgement: dict | None = None
+    source_words: list | None = None
 
 
 @dataclass
@@ -931,9 +932,12 @@ def build_moment(
             if start <= cue.start < start + span
         ]
         length, cues, peak, cuts = _tighten(start, span, cues, peak)
-        return Moment(candidate, path, start, length, cues, peak, detect_layout(path, start, span), cuts)
+        return Moment(
+            candidate, path, start, length, cues, peak, detect_layout(path, start, span), cuts,
+            source_words=list(words),
+        )
     segment, length, cues, peak, cuts, judgement = select_segment(audio, words, config)
-    moment = Moment(candidate, path, segment.start, length, cues, peak, None, cuts)
+    moment = Moment(candidate, path, segment.start, length, cues, peak, None, cuts, source_words=list(words))
     moment.segment = segment.to_dict()
     moment.judgement = judgement.to_dict()
     if judgement.accepted:
