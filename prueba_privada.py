@@ -52,6 +52,7 @@ def judge_version(config: dict) -> dict:
         "obligatorios": list(settings["obligatorios"]),
         "segundos_min": selection["segundos_min"],
         "segundos_max": selection["segundos_max"],
+        "cierre_colgante": "rechazo invariante; no está en obligatorios y no cambia el peso",
     }
     try:
         head = subprocess.run(
@@ -283,6 +284,7 @@ def _write_md(path: Path, record: dict) -> None:
         f"- Juez {judge.get('version', {}).get('modulo')} ({judge.get('version', {}).get('git', '')}): "
         f"ejecutado={judge.get('ejecutado')} puntuación={judge.get('puntuacion')} aceptado={judge.get('aceptado')}",
         f"- Motivos del juez: {'; '.join(judge.get('motivos') or []) or '—'}",
+        f"- Avisos no bloqueantes: {'; '.join(judge.get('avisos') or []) or '—'}",
         f"- Rechazado por: {', '.join(record.get('rechazado_por') or []) or '—'}",
         f"- QA: {record.get('qa')}",
         "",
@@ -355,6 +357,7 @@ def evaluate_candidate(candidate, config: dict, folder: Path, cache_dir: Path) -
         "aceptado": judgement.get("aceptado"),
         "puntuacion": judgement.get("puntuacion"),
         "motivos": judgement.get("motivos") or [],
+        "avisos": judgement.get("avisos") or [],
         "criterios": judgement.get("criterios") or {},
     }
     record["arco"] = _arco(moment)

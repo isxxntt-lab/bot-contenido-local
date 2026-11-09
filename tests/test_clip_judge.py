@@ -53,7 +53,65 @@ def test_sin_voz_se_descarta():
 
 def test_obligatorios_configurables():
     words = build(STORY)
-    segment = ns.Segment(0.0, 3.0, 1.0, 0, 3, complete_start=True, complete_end=True)
+    end_word = word_at(words, "hoy")
+    segment = ns.Segment(
+        0.0, end_word.end + 0.2, words[2].start, 0, words.index(end_word),
+        complete_start=True, complete_end=True,
+    )
     relaxed = {"seleccion": {"segundos_min": 1, "juez": {"obligatorios": [], "puntuacion_min": 0}}}
-    assert clip_judge.judge(words, segment, config=relaxed).accepted
+    verdict = clip_judge.judge(words, segment, config=relaxed)
+    assert verdict.accepted, verdict.reasons
     assert clip_judge.settings_from({"seleccion": {"juez": {"obligatorios": ["inventado"]}}})["obligatorios"] == []
+
+
+# Misma lista que clipazos.json: el cierre colgado no está en obligatorios y aun así rechaza.
+PROD = {
+    "seleccion": {
+        "segundos_min": 10,
+        "segundos_max": 45,
+        "pausa_frase": 0.6,
+        "pausa_unidad": 1.5,
+        "juez": {
+            "puntuacion_min": 0.6,
+            "obligatorios": ["inicio_completo", "final_completo", "remate", "duracion"],
+        },
+    }
+}
+
+
+def _ending(last: str) -> list:
+    return build([
+        ("Vale chat os cuento lo que acaba de pasar en la partida final.", 0.0),
+        ("El jefe sale por detrás y casi me mata del susto enorme.", 0.2),
+        ("NOOO", 0.2),
+        (f"Me ha dejado temblando y sin ninguna vida {last}", 0.2),
+    ])
+
+
+def test_por_con_puntuacion_de_asr_se_rechaza():
+    for last in ("por", "por.", "por!", "por?", "por…", "por..."):
+        words = _ending(last)
+        peak = word_at(words, "NOOO").start
+        segment = ns.segment_for_peak(words, peak, ns.settings_from(PROD), total=words[-1].end + 2)
+        verdict = clip_judge.judge(words, segment, config=PROD)
+        assert not verdict.accepted, (last, verdict.reasons, segment.to_dict())
+        assert any(item.startswith("cierre_colgante:") for item in verdict.reasons), (last, verdict.reasons)
+        assert verdict.criteria["final_completo"]["ok"] is True
+        assert "cierre_colgante" not in PROD["seleccion"]["juez"]["obligatorios"]
+
+
+def test_pario_y_dialogo_con_dos_unidades_siguen_aceptados():
+    words = build([
+        ("Vale hoy el jefe final tiene la barra casi vacía.", 0.0),
+        ("Salto esquivo el primer ataque y preparo el golpe.", 0.3),
+        ("NOOO", 2.0),
+        ("La puta que te parió!", 0.2),
+    ])
+    peak = word_at(words, "NOOO").start
+    segment = ns.segment_for_peak(words, peak, ns.settings_from(PROD), total=words[-1].end + 2)
+    verdict = clip_judge.judge(words, segment, length=segment.length, config=PROD)
+    assert verdict.criteria["cierre_colgante"]["ok"] is True
+    assert segment.crosses_units is True, segment.to_dict()
+    assert any("mezcla dos intervenciones" in item for item in verdict.warnings)
+    assert not any(item.startswith("cierre_colgante:") for item in verdict.reasons)
+    assert verdict.accepted, (verdict.reasons, verdict.warnings, segment.to_dict())

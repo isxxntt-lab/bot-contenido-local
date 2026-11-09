@@ -15,6 +15,13 @@ Criterios:
 - remate: tras el pico quedan al menos ``remate_min_segundos`` y alguna palabra.
 - autocontencion: no empieza con un conector («y», «pero», «porque»...), no
   acaba colgando («de», «que», «el»...) y tiene al menos ``min_palabras``.
+  Cruzar dos unidades solo avisa: un diálogo seguido puede hacerlo.
+- cierre_colgante: la última palabra es gramatical («por», «de», «que»...),
+  aunque el reconocedor le pegue «.», «!», «?» o puntos suspensivos. Pesa 0
+  para no mover la nota del resto y, aun así, rechaza siempre: no depende de
+  ``obligatorios`` ni de la puntuación. No decide si la historia tiene causa
+  o remate; eso siguen midiéndolo final_completo (pausa o puntuación) y
+  remate (tiempo y alguna palabra tras el pico).
 - duracion: la duración final está entre seleccion.segundos_min y segundos_max.
 
 Es una heurística sobre la transcripción: no entiende el chiste ni el contexto.
@@ -34,6 +41,8 @@ WEIGHTS = {
     "remate": 0.2,
     "autocontencion": 0.1,
     "duracion": 0.1,
+    # Peso 0: no cambia la media. El rechazo va aparte, en judge().
+    "cierre_colgante": 0.0,
 }
 
 DEFAULTS: dict = {
@@ -80,6 +89,7 @@ class Judgement:
     score: float
     criteria: dict = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -87,6 +97,7 @@ class Judgement:
             "puntuacion": round(self.score, 3),
             "criterios": self.criteria,
             "motivos": self.reasons,
+            "avisos": self.warnings,
         }
 
     @property
@@ -96,6 +107,15 @@ class Judgement:
 
 def _plain(word: str) -> str:
     return re.sub(r"[^\wáéíóúñü]", "", word, flags=re.IGNORECASE).casefold()
+
+
+def _dangling_close(text: str) -> bool:
+    """«por», «por.», «por!», «por?» o «por...» siguen siendo un final colgado.
+
+    La puntuación que añade el reconocedor no convierte una preposición en cierre.
+    Una palabra con contenido («parió!») no entra en esta lista.
+    """
+    return _plain(text) in DANGLING_ENDS
 
 
 def judge(
@@ -156,7 +176,8 @@ def judge(
     if inside and _plain(inside[0].text) in START_CONNECTORS:
         points -= 0.5
         notes.append(f"empieza con «{inside[0].text.strip()}»")
-    if inside and _plain(inside[-1].text) in DANGLING_ENDS and not inside[-1].text.rstrip().endswith(narrative_segments.SENTENCE_END):
+    dangling = bool(inside) and _dangling_close(inside[-1].text)
+    if dangling:
         points -= 0.5
         notes.append(f"acaba colgando en «{inside[-1].text.strip()}»")
     if len(inside) < int(s["min_palabras"]):
@@ -166,6 +187,11 @@ def judge(
         points -= 0.25
         notes.append("mezcla dos intervenciones")
     put("autocontencion", points, "; ".join(notes) or "se entiende solo")
+    put(
+        "cierre_colgante",
+        0.0 if dangling else 1.0,
+        f"la última palabra «{inside[-1].text.strip()}» no cierra" if dangling else "la última palabra no es un nexo colgado",
+    )
     # duración
     ok_length = selection["segundos_min"] <= duration <= selection["segundos_max"]
     put(
@@ -176,6 +202,16 @@ def judge(
 
     score = sum(WEIGHTS[name] * criteria[name]["puntos"] for name in WEIGHTS) / sum(WEIGHTS.values())
     reasons = [f"{name}: {criteria[name]['motivo']}" for name in s["obligatorios"] if not criteria[name]["ok"]]
+    # Invariante: el JSON de producción lista otros obligatorios y no puede apagar esto.
+    if not criteria["cierre_colgante"]["ok"]:
+        reasons.append(f"cierre_colgante: {criteria['cierre_colgante']['motivo']}")
     if score < float(s["puntuacion_min"]):
         reasons.append(f"puntuación {score:.2f} < {float(s['puntuacion_min']):.2f}")
-    return Judgement(not reasons, score, criteria, reasons)
+    reasons = list(dict.fromkeys(reasons))
+    blocking = {item.split(":", 1)[0] for item in reasons}
+    warnings = [
+        f"{name}: {criteria[name]['motivo']}"
+        for name, item in criteria.items()
+        if not item["ok"] and name not in blocking
+    ]
+    return Judgement(not reasons, score, criteria, reasons, warnings)
