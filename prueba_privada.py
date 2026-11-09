@@ -773,10 +773,11 @@ def _juzgar_una_vez(package: dict, client, juez_contextual) -> dict:
     if not isinstance(trace, dict):
         trace = {"raw": str(trace), "error": None}
     coverage = paquete_contextual.cobertura_entrada(package)
-    if trace.get("error") or not trace.get("raw"):
+    corr = paquete_contextual.correlacionar_observacion(trace) if isinstance(trace, dict) else {"valida": False, "motivo": "sin traza"}
+    if trace.get("error") or not trace.get("raw") or not corr.get("valida"):
         verdict = {
             "decision": "abstain",
-            "motivo": trace.get("error") or "respuesta vacía",
+            "motivo": (trace.get("error") if isinstance(trace, dict) else None) or (None if corr.get("valida") else corr.get("motivo")) or "respuesta vacía",
             "valido": False,
             "evidencias": [],
         }
