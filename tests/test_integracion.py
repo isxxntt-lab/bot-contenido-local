@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import pytest
 
 import clipazos
+import entorno
 import publication_guard as pg
 import youtube_upload
 from conftest import ROOT, allowed_config
@@ -160,6 +161,7 @@ def test_make_short_aplica_qa(tmp_path, videos, monkeypatch):
 
 
 def test_main_dry_run_sin_red(tmp_path, monkeypatch):
+    monkeypatch.setattr(entorno, "comprobar", lambda: entorno.InformeEntorno(True, version="7.1"))
     monkeypatch.setattr(clipazos, "CLIPAZOS_DIR", tmp_path)
     monkeypatch.setattr(clipazos, "CACHE_DIR", tmp_path / "cache")
     monkeypatch.setattr(clipazos, "RADAR_PATH", tmp_path / "radar.json")

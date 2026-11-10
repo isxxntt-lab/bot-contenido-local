@@ -21,6 +21,10 @@ del montaje, el QA bloqueante (qa.py); y antes de subir, la guardia de publicaci
 (publication_guard.py: kill switch, cupos y duplicados). --dry-run hace todo menos
 llamar a la API de YouTube.
 
+Al arrancar, entorno.py comprueba FFmpeg (>= 7, los filtros del montaje y un
+smoke de -/filter_complex) y la fuente Arial Black. Si falla, sale con
+entorno_no_apto y no monta ni sube nada.
+
 La configuración del canal vive en clipazos.json.
 """
 
@@ -41,6 +45,7 @@ from pathlib import Path
 import numpy as np
 
 import clip_judge
+import entorno
 import narrative_segments
 import publication_guard
 import qa
@@ -1275,8 +1280,10 @@ def render_short(
     command = [_ffmpeg_exe(), "-y"]
     for moment in moments:
         command.extend(["-i", str(moment.path)])
+    # -/filter_complex lee el archivo. FFmpeg 7 lo documenta (y marca
+    # -filter_complex_script como obsoleto); FFmpeg 9 ya no reconoce la opción vieja.
     command.extend(
-        ["-filter_complex_script", str(script), "-map", "[vout]", "-map", "[aout]",
+        [*entorno.opcion_filtro_complejo(script), "-map", "[vout]", "-map", "[aout]",
          "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
          "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(destination)]
     )
@@ -1520,6 +1527,12 @@ def main(argv: list[str] | None = None) -> int:
         config["seleccion"] = {**selection, "max_momentos": args.clips}
     if args.segundos:
         config["segundos_objetivo"] = args.segundos
+    # Antes de buscar, descargar, montar o subir: si el PC no puede montar, el lote se para.
+    informe_entorno = entorno.comprobar()
+    if not informe_entorno.apto:
+        print(informe_entorno.linea_log(), file=sys.stderr)
+        return entorno.EXIT_ENTORNO_NO_APTO
+    print(informe_entorno.linea_log())
     channel = config.get("canal", "Clipazos ES")
     language = config.get("idioma", "es")
     today = datetime.now().strftime("%Y%m%d")
