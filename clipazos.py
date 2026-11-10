@@ -2,7 +2,8 @@
 
 Flujo 100 % local y sin claves:
   1. Twitch (API pública de su web): clips en español de las últimas 24 h en los
-     juegos más vistos y en las categorías fijas. Kick y YouTube: streamers fijos.
+     juegos más vistos y en las categorías fijas, más los de una lista fija de
+     streamers (recientes e históricos). Kick y YouTube: streamers fijos.
   2. Radar: guarda las vistas por juego y por streamer de cada día para detectar
      qué juego se dispara (Short especial de hype) y quién está subiendo.
   3. yt-dlp localiza cada clip y FFmpeg recorta solo el tramo necesario.
@@ -30,9 +31,11 @@ import argparse
 import json
 import math
 import re
+import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -133,6 +136,8 @@ class Candidate:
     vod_id: str | None = None
     offset: float | None = None
     chat_rate: float | None = None
+    historico: bool = False
+    login: str | None = None
 
 
 @dataclass
@@ -373,8 +378,288 @@ def scout_twitch(settings: dict, language: str) -> list[Candidate]:
                 game=(node.get("game") or {}).get("name") or category,
                 created=_parse_time(node.get("createdAt")),
                 seconds=float(node["durationSeconds"]),
+                login=broadcaster.get("login"),
             )
     return sorted(found.values(), key=lambda candidate: candidate.views, reverse=True)
+
+
+# Periodos que admite la GQL pública de clips. Recientes e históricos no se mezclan.
+_RECENT_PERIODS = ("LAST_DAY", "LAST_WEEK")
+_HISTORICAL_PERIODS = ("LAST_MONTH", "ALL_TIME")
+# Dos clips del mismo VOD que arrancan así de cerca son el mismo momento.
+_MISMO_MOMENTO_SEGUNDOS = 5.0
+
+
+def _as_int(value, default: int, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    number = int(value)
+    return number if number >= minimum else default
+
+
+def _login_list(values) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    logins: list[str] = []
+    for name in values:
+        login = str(name).strip().lstrip("@").lower()
+        if login and login not in logins:
+            logins.append(login)
+    return logins
+
+
+def _periodos(values, allowed: tuple[str, ...], default: tuple[str, ...]) -> list[str]:
+    found: list[str] = []
+    raw = values if isinstance(values, list) else [values]
+    for period in raw:
+        token = str(period).strip().upper()
+        if token in allowed and token not in found:
+            found.append(token)
+    return found or list(default)
+
+
+def twitch_streamer_plan(settings: dict | None) -> dict:
+    """Logins, periodos y cupos de twitch.streamers_fijos / twitch.historicos."""
+    settings = settings or {}
+    recent = settings.get("recientes") if isinstance(settings.get("recientes"), dict) else {}
+    historical = settings.get("historicos") if isinstance(settings.get("historicos"), dict) else {}
+    period = str(historical.get("periodo") or "ALL_TIME").strip().upper()
+    if period not in _HISTORICAL_PERIODS:
+        period = "ALL_TIME"
+    return {
+        "logins": _login_list(settings.get("streamers_fijos")),
+        "recent_periods": _periodos(recent.get("periodos"), _RECENT_PERIODS, _RECENT_PERIODS),
+        "recent_first": _as_int(recent.get("por_streamer"), 8, minimum=1),
+        "recent_min_views": _as_int(recent.get("vistas_minimas"), 0),
+        "historical_active": historical.get("activo") is True,
+        "historical_period": period,
+        "historical_first": _as_int(historical.get("por_streamer"), 4, minimum=1),
+        "historical_min_views": _as_int(historical.get("vistas_minimas"), 50_000),
+        "min_clips": _as_int(settings.get("min_clips"), 2, minimum=1),
+        "min_clips_fijos": _as_int(settings.get("min_clips_fijos"), 1, minimum=1),
+    }
+
+
+def helix_activo(settings: dict | None) -> bool:
+    helix = (settings or {}).get("helix")
+    return isinstance(helix, dict) and helix.get("activa") is True
+
+
+def scout_twitch_helix(
+    settings: dict | None, login: str, period: str, first: int
+) -> list[Candidate] | None:
+    """Hueco para Twitch Helix. No llama a la API ni pide credenciales.
+
+    None: no hay segundo camino y el llamador se queda con lo que trajo la GQL.
+    """
+    del login, period, first
+    if not helix_activo(settings):
+        return None
+    print(
+        "  Aviso: twitch.helix.activa está encendido, pero Helix todavía no está implementado. Se sigue con la GQL.",
+        file=sys.stderr,
+    )
+    return None
+
+
+def _user_clips_query(login: str, period: str, first: int) -> str:
+    return (
+        "query{user(login:%s){login clips(criteria:{period:%s}, first:%d)"
+        "{edges{node{slug title viewCount durationSeconds createdAt language "
+        "videoOffsetSeconds video{id} broadcaster{login displayName} game{name}}}}}}"
+    ) % (json.dumps(login), period, int(first))
+
+
+def _clip_en_espanol(node: dict, language: str) -> bool:
+    """True si el idioma falta o es el del canal. Un EN explícito se descarta."""
+    raw = node.get("language")
+    if raw is None or not str(raw).strip():
+        return True
+    code = str(raw).strip().lower().replace("_", "-")
+    wanted = (language or "es").strip().lower().replace("_", "-") or "es"
+    return code == wanted or code.startswith(wanted + "-")
+
+
+def _vod_de_clip(node: dict) -> tuple[str | None, float | None]:
+    video = node.get("video") or {}
+    vod_id = str(video["id"]) if video.get("id") else None
+    offset = node.get("videoOffsetSeconds")
+    if vod_id is None or offset is None:
+        return vod_id, None
+    try:
+        return vod_id, float(offset)
+    except (TypeError, ValueError):
+        return vod_id, None
+
+
+def _candidate_from_twitch_clip(
+    node: dict, *, historico: bool, login: str, language: str, min_views: int
+) -> Candidate | None:
+    if not isinstance(node, dict) or not _clip_en_espanol(node, language):
+        return None
+    slug = str(node.get("slug") or "").strip()
+    if not slug:
+        return None
+    try:
+        duration = float(node.get("durationSeconds") or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration < 10:
+        return None
+    try:
+        views = int(node.get("viewCount") or 0)
+    except (TypeError, ValueError):
+        views = 0
+    if views < min_views:
+        return None
+    broadcaster = node.get("broadcaster") or {}
+    name = broadcaster.get("displayName") or broadcaster.get("login") or login
+    vod_id, offset = _vod_de_clip(node)
+    return Candidate(
+        platform="Twitch",
+        streamer=name,
+        title=str(node.get("title") or ""),
+        views=views,
+        url=f"https://clips.twitch.tv/{slug}",
+        key=f"twitch-{slug}",
+        game=(node.get("game") or {}).get("name"),
+        created=_parse_time(node.get("createdAt")),
+        seconds=duration,
+        vod_id=vod_id,
+        offset=offset,
+        historico=historico,
+        login=broadcaster.get("login") or login,
+    )
+
+
+def _prefer_clip(current: Candidate, new: Candidate) -> Candidate:
+    """El reciente gana al histórico del mismo momento. Si no, mandan las vistas."""
+    if current.historico != new.historico:
+        chosen = current if not current.historico else new
+        other = new if chosen is current else current
+    elif new.views > current.views:
+        chosen, other = new, current
+    else:
+        chosen, other = current, new
+    if chosen.vod_id is None and other.vod_id:
+        chosen.vod_id = other.vod_id
+        chosen.offset = other.offset
+    return chosen
+
+
+def _mismo_momento(left: Candidate, right: Candidate) -> bool:
+    if not left.vod_id or not right.vod_id or left.vod_id != right.vod_id:
+        return False
+    if left.offset is None or right.offset is None:
+        return False
+    return abs(left.offset - right.offset) <= _MISMO_MOMENTO_SEGUNDOS
+
+
+def dedupe_twitch_candidates(candidates: list[Candidate]) -> list[Candidate]:
+    """Un slug, una ficha. Con VOD, también un arranque (vod_id + offset).
+
+    attach_chat solo rellena el offset de unos 16 clips, así que los de
+    streamers fijos traen video.id y videoOffsetSeconds en la propia consulta.
+    """
+    by_slug: dict[str, Candidate] = {}
+    order: list[str] = []
+    for candidate in candidates:
+        slug = (_clip_slug(candidate) or candidate.key).casefold()
+        if slug not in by_slug:
+            by_slug[slug] = candidate
+            order.append(slug)
+        else:
+            by_slug[slug] = _prefer_clip(by_slug[slug], candidate)
+    kept: list[Candidate] = []
+    for slug in order:
+        candidate = by_slug[slug]
+        for index, previous in enumerate(kept):
+            if _mismo_momento(previous, candidate):
+                kept[index] = _prefer_clip(previous, candidate)
+                break
+        else:
+            kept.append(candidate)
+    return kept
+
+
+def merge_twitch_candidates(*groups: list[Candidate]) -> list[Candidate]:
+    """Une la búsqueda por categoría con la de streamers fijos."""
+    merged = dedupe_twitch_candidates([candidate for group in groups for candidate in group])
+    return sorted(merged, key=lambda candidate: candidate.views, reverse=True)
+
+
+def _avisar_tope_gql(settings: dict) -> None:
+    print("  Aviso: Twitch respondió 429. Se guardan los clips ya reunidos.", file=sys.stderr)
+    if helix_activo(settings):
+        scout_twitch_helix(settings, "", "", 0)
+    else:
+        print("  Helix está apagado (twitch.helix.activa = false); no hay otro camino.", file=sys.stderr)
+
+
+def _consultar_usuario(query: str, login: str) -> tuple[str, dict]:
+    """('ok', data), ('rate', {}) si hay 429, o ('error', {}) si la GQL falla."""
+    try:
+        return "ok", _gql(query)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            return "rate", {}
+        print(f"  Aviso: Twitch respondió HTTP {exc.code} para @{login}.", file=sys.stderr)
+        return "error", {}
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"  Aviso: la GQL de Twitch falló para @{login} ({exc}).", file=sys.stderr)
+        return "error", {}
+
+
+def scout_twitch_streamers(settings: dict, language: str = "es") -> list[Candidate]:
+    """Clips de twitch.streamers_fijos: recientes (LAST_DAY/LAST_WEEK) e históricos.
+
+    La GQL es el camino por defecto. Un login que no existe se avisa y se salta.
+    Un 429 o un error de esa consulta no tiran la ejecución: se conserva lo ya
+    reunido. Helix queda apagado (twitch.helix.activa) y no se pide ninguna clave.
+    El idioma se filtra solo cuando el clip lo trae; si falta, el clip se queda.
+    No va en criteria.languages para no perder los que vienen sin etiqueta.
+    """
+    plan = twitch_streamer_plan(settings)
+    if not plan["logins"]:
+        return []
+    jobs: list[tuple[str, int, int, bool]] = [
+        (period, plan["recent_first"], plan["recent_min_views"], False) for period in plan["recent_periods"]
+    ]
+    if plan["historical_active"]:
+        jobs.append((plan["historical_period"], plan["historical_first"], plan["historical_min_views"], True))
+    found: list[Candidate] = []
+    missing: set[str] = set()
+    helix_avisado = False
+    for login in plan["logins"]:
+        for period, first, minimum, historico in jobs:
+            if login in missing:
+                break
+            status, data = _consultar_usuario(_user_clips_query(login, period, first), login)
+            if status == "rate":
+                _avisar_tope_gql(settings)
+                return dedupe_twitch_candidates(found)
+            if status != "ok":
+                if helix_activo(settings) and not helix_avisado:
+                    scout_twitch_helix(settings, login, period, first)
+                    helix_avisado = True
+                continue
+            user = data.get("user") if isinstance(data, dict) else None
+            if not user:
+                print(f"  Aviso: @{login} no existe en Twitch; se salta.", file=sys.stderr)
+                missing.add(login)
+                break
+            edges = ((user.get("clips") or {}).get("edges")) or []
+            for edge in edges:
+                candidate = _candidate_from_twitch_clip(
+                    (edge or {}).get("node") or {},
+                    historico=historico,
+                    login=login,
+                    language=language,
+                    min_views=minimum,
+                )
+                if candidate is not None:
+                    found.append(candidate)
+    return dedupe_twitch_candidates(found)
 
 
 def _ytdlp(options: dict | None = None):
@@ -607,10 +892,69 @@ def _whisper():
     return _MODEL
 
 
-def transcribe(audio: np.ndarray, language: str) -> list[CaptionCue]:
-    segments, _info = _whisper().transcribe(
-        audio, language=language, word_timestamps=True, vad_filter=True
-    )
+# faster-whisper 1.2.1 acepta hotwords (str). En get_prompt los ignora si
+# también llega prefix («Has no effect if prefix is not None»), así que aquí
+# no se mandan los dos a la vez.
+_HOTWORDS_MAX = 200
+
+
+def asr_hotwords(config: dict | None, streamer: str | None = None) -> str | None:
+    """Pista para el ASR: lista de clipazos.json más el nombre del streamer.
+
+    None si asr.hotwords_activa no está encendido. Como mucho 200 caracteres.
+    El nombre del streamer se conserva aunque haya que recortar la lista base.
+    """
+    raw = (config or {}).get("asr")
+    raw = raw if isinstance(raw, dict) else {}
+    if raw.get("hotwords_activa") is not True:
+        return None
+    seen: set[str] = set()
+    base_words: list[str] = []
+    base = raw.get("hotwords") or []
+    if isinstance(base, str):
+        base = [part.strip() for part in base.split(",")]
+    if not isinstance(base, list):
+        base = []
+    for item in base:
+        word = " ".join(str(item).split())
+        if not word or word.casefold() in seen:
+            continue
+        seen.add(word.casefold())
+        base_words.append(word)
+    name = " ".join(str(streamer or "").split()).lstrip("@")
+    tail = ""
+    if name:
+        base_words = [word for word in base_words if word.casefold() != name.casefold()]
+        tail = name[:_HOTWORDS_MAX].strip()
+    chosen: list[str] = []
+    for word in base_words:
+        parts = [*chosen, word, tail] if tail else [*chosen, word]
+        if len(" ".join(parts)) > _HOTWORDS_MAX:
+            break
+        chosen.append(word)
+    text = " ".join([*chosen, tail] if tail else chosen).strip()
+    return text or None
+
+
+def _opciones_transcripcion(
+    language: str, config: dict | None, streamer: str | None, prefix: str | None = None
+) -> dict:
+    """Argumentos de WhisperModel.transcribe. hotwords y prefix no viajan juntos."""
+    kwargs: dict = {"language": language, "word_timestamps": True, "vad_filter": True}
+    if prefix:
+        kwargs["prefix"] = prefix
+    hotwords = asr_hotwords(config, streamer)
+    if hotwords and "prefix" not in kwargs:
+        kwargs["hotwords"] = hotwords
+    return kwargs
+
+
+def transcribe(
+    audio: np.ndarray, language: str, config: dict | None = None, streamer: str | None = None
+) -> list[CaptionCue]:
+    """Transcribe con faster-whisper. Con el flag apagado la llamada no cambia."""
+    kwargs = _opciones_transcripcion(language, config, streamer)
+    segments, _info = _whisper().transcribe(audio, **kwargs)
     return sync_cues(
         [
             CaptionCue(word.word.strip(), float(word.start), float(word.end))
@@ -922,7 +1266,7 @@ def build_moment(
     audio = load_audio(path)
     if audio.size == 0:
         raise RuntimeError("el clip no tiene audio")
-    words = transcribe(audio, language)
+    words = transcribe(audio, language, config, candidate.streamer)
     if config is None:
         # Camino antiguo (sin config): ventana por picos.
         start, span, peak = choose_window(audio, words, shortest, longest)
@@ -981,6 +1325,7 @@ def _log_moment(candidate: Candidate, moment: Moment | None, status: str, reason
         "puntuacion": judgement.get("puntuacion"),
         "motivos": judgement.get("motivos", []) + ([reason] if reason else []),
         "criterios": judgement.get("criterios", {}),
+        "historico": bool(candidate.historico),
     }
     if moment is not None and moment.segment:
         entry["tramo"] = {
@@ -1318,13 +1663,18 @@ def make_short(
     if not moments:
         print("  Ningún momento completo para este Short.", file=sys.stderr)
         return None
+    if all(moment.candidate.historico for moment in moments):
+        name = moments[0].candidate.streamer
+        title = [[("UN CLÁSICO DE", False)], [(f"@{name.upper()}", True)]]
+        headline = f"Un clásico de {name}"
     render_short(moments, title, config.get("canal", "Clipazos ES"), destination)
     post = post_text(moments, headline, extra_tags)
     post["video"] = str(destination)
     post["duracion"] = round(sum(moment.length for moment in moments), 1)
+    post["historico"] = any(moment.candidate.historico for moment in moments)
     unique = list({moment.candidate.key: moment.candidate for moment in moments}.values())
     post["clips"] = [candidate.key for candidate in unique]
-    post["fuentes"] = [rights.source_info(candidate) for candidate in unique]
+    post["fuentes"] = [_fuente_reporte(candidate) for candidate in unique]
     post["seleccion"] = _SELECTION_LOG[first_log:]
     post["cortes"], post["picos_short"] = _cut_info(moments)
     print(f"  Vídeo: {destination} ({post['duracion']}s, {destination.stat().st_size} bytes)")
@@ -1409,10 +1759,41 @@ def streamer_pool(candidates: list[Candidate], name: str) -> list[Candidate]:
     return sorted(pool, key=lambda candidate: candidate.views, reverse=True)
 
 
+def _puntos_streamer(pool: list[Candidate], best_of: int) -> tuple[int, int]:
+    """Vistas recientes primero. Las históricas solo desempatan, no roban el día."""
+    recent = sorted((candidate.views for candidate in pool if not candidate.historico), reverse=True)
+    old = sorted((candidate.views for candidate in pool if candidate.historico), reverse=True)
+    return (sum(recent[:best_of]), sum(old[:best_of]))
+
+
+def _minimo_de_pool(name: str, pool: list[Candidate], floors: dict[str, int], default: int) -> int:
+    keys = {name.casefold().lstrip("@")}
+    for candidate in pool:
+        keys.add(candidate.streamer.casefold().lstrip("@"))
+        if candidate.login:
+            keys.add(candidate.login.casefold().lstrip("@"))
+    found = [floors[key] for key in keys if key in floors]
+    return min(found) if found else default
+
+
 def top_streamers(
-    candidates: list[Candidate], count: int, skip: set[str], min_clips: int = 2, best_of: int = 4
+    candidates: list[Candidate],
+    count: int,
+    skip: set[str],
+    min_clips: int = 2,
+    best_of: int = 4,
+    min_clips_por_streamer: dict[str, int] | None = None,
 ) -> list[tuple[str, list[Candidate]]]:
-    """Streamers con más vistas en sus mejores clips del día, cada uno con sus clips."""
+    """Streamers con más vistas en sus mejores clips, cada uno con sus clips.
+
+    El mínimo general sigue en 2. ``min_clips_por_streamer`` baja ese suelo para
+    los streamers fijos (por defecto 1): un solo clip bueno ya puede entrar y
+    el juez decide si el momento vale.
+    """
+    floors = {
+        str(key).casefold().lstrip("@"): value
+        for key, value in (min_clips_por_streamer or {}).items()
+    }
     pools: dict[str, list[Candidate]] = {}
     for candidate in candidates:
         if candidate.streamer.casefold() in skip:
@@ -1421,9 +1802,9 @@ def top_streamers(
     ranked = [
         (name, sorted(pool, key=lambda candidate: candidate.views, reverse=True))
         for name, pool in pools.items()
-        if len(pool) >= min_clips
+        if len(pool) >= _minimo_de_pool(name, pool, floors, min_clips)
     ]
-    ranked.sort(key=lambda item: sum(c.views for c in item[1][:best_of]), reverse=True)
+    ranked.sort(key=lambda item: _puntos_streamer(item[1], best_of), reverse=True)
     return ranked[:count]
 
 
@@ -1447,13 +1828,107 @@ def recently_posted(today: str, days: int) -> set[str]:
     return names
 
 
+def _dia_reporte(path: Path) -> str | None:
+    if path.stem.endswith(DRY_RUN_SUFFIX):
+        return None
+    parts = path.stem.split("_")
+    if len(parts) < 2 or len(parts[1]) != 8 or not parts[1].isdigit():
+        return None
+    return parts[1]
+
+
+def _claves_de_candidato(candidate: Candidate) -> set[str]:
+    keys: set[str] = set()
+    if candidate.key and str(candidate.key).strip():
+        keys.add(str(candidate.key).strip().casefold())
+    slug = (_clip_slug(candidate) or "").casefold()
+    if slug:
+        keys.add(slug)
+        keys.add(f"twitch-{slug}")
+    return keys
+
+
+def clips_ya_publicados(today: str, days: int, config: dict | None = None) -> set[str]:
+    """Clips que no deben volver a salir.
+
+    En la ventana de ``no_repetir_dias`` cuenta cualquier Short de un reporte
+    real. El historial de publicaciones (base y shorts con youtube_id) cuenta
+    siempre, aunque el clip sea antiguo. Los reportes ``_dryrun`` no cuentan.
+    """
+    keys: set[str] = set()
+    limit = ""
+    if days > 0:
+        try:
+            limit = (datetime.strptime(today, "%Y%m%d") - timedelta(days=days)).strftime("%Y%m%d")
+        except ValueError:
+            limit = ""
+    if CLIPAZOS_DIR.is_dir():
+        for path in CLIPAZOS_DIR.glob("reporte_*.json"):
+            day = _dia_reporte(path)
+            if day is None:
+                continue
+            in_window = bool(limit) and limit <= day < today
+            try:
+                shorts = json.loads(path.read_text(encoding="utf-8")).get("shorts") or []
+            except (OSError, ValueError):
+                continue
+            for short in shorts:
+                if not isinstance(short, dict):
+                    continue
+                if not in_window and not short.get("youtube_id"):
+                    continue
+                for key in short.get("clips") or []:
+                    text = str(key).strip().casefold()
+                    if text:
+                        keys.add(text)
+    try:
+        keys.update(publication_guard.PublicationGuard(config or {}).published_clip_keys())
+    except (OSError, sqlite3.Error):
+        print("  Aviso: no se pudo leer el historial de publicaciones.", file=sys.stderr)
+    return keys
+
+
+def sin_clips_publicados(candidates: list[Candidate], used: set[str]) -> list[Candidate]:
+    if not used:
+        return list(candidates)
+    return [candidate for candidate in candidates if not (_claves_de_candidato(candidate) & used)]
+
+
+def _fuente_reporte(candidate: Candidate) -> dict:
+    info = rights.source_info(candidate)
+    info["historico"] = bool(candidate.historico)
+    return info
+
+
+def ordenar_para_short(pool: list[Candidate], config: dict | None = None) -> list[Candidate]:
+    """Picos de hoy primero. El mejor histórico ocupa el último hueco que mira el juez."""
+    recent = rank_clips([candidate for candidate in pool if not candidate.historico])
+    historical = sorted(
+        (candidate for candidate in pool if candidate.historico),
+        key=lambda candidate: candidate.views,
+        reverse=True,
+    )
+    if not historical:
+        return recent
+    if not recent:
+        return historical
+    budget = narrative_segments.settings_from(config)["candidatos_a_evaluar"]
+    if budget <= 1:
+        return recent + historical
+    keep = budget - 1
+    return recent[:keep] + historical[:1] + recent[keep:] + historical[1:]
+
+
 def streamer_short(
     pool: list[Candidate], name: str, config: dict, today: str, game: str | None = None
 ) -> dict | None:
     """Short de un solo streamer: primero el pico de chat y de sonido, no el clip más largo."""
     name = pool[0].streamer if pool else name
-    pool = rank_clips(pool)
-    print(f"\nShort de @{name}: {len(pool)} clips en las últimas 24 h, ordenados por el pico")
+    pool = ordenar_para_short(pool, config)
+    recent_count = sum(not candidate.historico for candidate in pool)
+    old_count = len(pool) - recent_count
+    extra = f" y {old_count} histórico{'s' if old_count != 1 else ''}" if old_count else ""
+    print(f"\nShort de @{name}: {recent_count} clips recientes{extra}, ordenados por el pico")
     if game:
         title = [[("@" + name.upper(), True)], [("EN " + game.upper(), False)]]
         headline = f"Lo mejor de {name} en {game} hoy"
@@ -1535,15 +2010,29 @@ def main(argv: list[str] | None = None) -> int:
             _upload(config, daily_report, args.config, args.dry_run)
             _refresh_tiktok(config, daily_report, args.dry_run)
             return 0
-    print(f"{channel}: buscando momentazos de las últimas 24 h...")
+    print(f"{channel}: buscando momentazos de las últimas 24 h y de los streamers fijos...")
     clean_cache(keep_videos=int(config.get("dias_guardar_videos", 14)))
 
-    twitch = scout_twitch(config.get("twitch", {}), language)
+    twitch_settings = config.get("twitch", {})
+    plan = twitch_streamer_plan(twitch_settings)
+    twitch = scout_twitch(twitch_settings, language)
+    de_streamers = scout_twitch_streamers(twitch_settings, language)
     kick = scout_kick(config.get("kick", {}))
     youtube = scout_youtube(config.get("youtube", {}))
-    print(f"Clips encontrados: Twitch {len(twitch)}, Kick {len(kick)}, YouTube {len(youtube)}")
+    repeat_days = int(config.get("no_repetir_dias", 2))
+    usados = clips_ya_publicados(today, repeat_days, config)
+    twitch = sin_clips_publicados(twitch, usados)
+    de_streamers = sin_clips_publicados(de_streamers, usados)
+    recientes_fijos = sum(not candidate.historico for candidate in de_streamers)
+    historicos_fijos = sum(candidate.historico for candidate in de_streamers)
+    print(
+        f"Clips encontrados: Twitch {len(twitch)} por categoría, "
+        f"{recientes_fijos} recientes de streamers fijos, {historicos_fijos} históricos, "
+        f"Kick {len(kick)}, YouTube {len(youtube)}"
+    )
 
     radar_settings = config.get("radar", {})
+    # El radar compara el día. Los virales históricos no entran en esa cuenta.
     history = update_radar(twitch, today, int(radar_settings.get("dias_historial", 14)))
     hot = hype_games(history, today, radar_settings)
     rising = rising_streamers(history, today)
@@ -1556,6 +2045,9 @@ def main(argv: list[str] | None = None) -> int:
     for name, views, baseline in rising:
         print(f"  Subiendo @{name}: {views} vistas hoy (media {baseline:.0f})")
 
+    twitch = merge_twitch_candidates(twitch, de_streamers)
+    historicos_encontrados = [candidate for candidate in twitch if candidate.historico]
+
     # Derechos antes de descargar o editar: el radar usa todos los clips, el resto solo los permitidos.
     twitch = apply_rights(twitch, config, "Twitch")
     kick = apply_rights(kick, config, "Kick")
@@ -1566,6 +2058,18 @@ def main(argv: list[str] | None = None) -> int:
         "fecha": today,
         "hype": [{"juego": game, "vistas": views, "media": round(baseline)} for game, views, baseline in hot],
         "subiendo": [{"streamer": name, "vistas": views, "media": round(baseline)} for name, views, baseline in rising],
+        "historicos": [
+            {
+                "key": candidate.key,
+                "streamer": candidate.streamer,
+                "titulo": candidate.title,
+                "vistas": candidate.views,
+                "url": candidate.url,
+                "juego": candidate.game or "",
+                "historico": True,
+            }
+            for candidate in historicos_encontrados
+        ],
         "shorts": [],
         "seleccion": _SELECTION_LOG,
     }
@@ -1576,8 +2080,12 @@ def main(argv: list[str] | None = None) -> int:
             report["shorts"].append(short)
     elif not args.solo_radar:
         wanted = int(config.get("shorts_por_dia", 1))
-        recent = recently_posted(today, int(config.get("no_repetir_dias", 2)))
-        picked = top_streamers(twitch, wanted, excluded | recent)
+        recent = recently_posted(today, repeat_days)
+        floors = {login: plan["min_clips_fijos"] for login in plan["logins"]}
+        picked = top_streamers(
+            twitch, wanted, excluded | recent,
+            min_clips=plan["min_clips"], min_clips_por_streamer=floors,
+        )
         if not picked:
             print("\nNo hay ningún streamer con clips suficientes hoy.", file=sys.stderr)
         for name, pool in picked:
@@ -1595,7 +2103,10 @@ def main(argv: list[str] | None = None) -> int:
             game = hot[0][0]
             used = {short["streamer"].casefold() for short in report["shorts"]}
             in_game = [c for c in twitch if c.game == game]
-            for name, pool in top_streamers(in_game, 1, excluded | used):
+            for name, pool in top_streamers(
+                in_game, 1, excluded | used,
+                min_clips=plan["min_clips"], min_clips_por_streamer=floors,
+            ):
                 print(f"\nJuego en hype: {game}")
                 short = streamer_short(pool, name, config, today, game=game)
                 if short:
