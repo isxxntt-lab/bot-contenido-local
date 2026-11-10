@@ -108,6 +108,13 @@ def allowed_config(tmp_path: Path, **publication) -> dict:
     }
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "ffmpeg_real: instala imageio-ffmpeg en un venv (red). CLIPAZOS_FFMPEG_REAL=1",
+    )
+
+
 @pytest.fixture(autouse=True)
 def _export_tiktok_temporal(tmp_path, monkeypatch):
     """Las pruebas nunca escriben en export_tiktok/ ni en el Escritorio reales."""

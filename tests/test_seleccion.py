@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 import clipazos
+import entorno
 from conftest import ROOT
 from transcripts import STORY, build, word_at
 
@@ -142,6 +143,7 @@ def test_tighten_no_corta_dentro_de_una_frase():
 
 def test_flag_clips_sube_max_momentos(monkeypatch, tmp_path):
     config = {"canal": "C"}
+    monkeypatch.setattr(entorno, "comprobar", lambda: entorno.InformeEntorno(True, version="7.1"))
     monkeypatch.setattr(clipazos, "load_config", lambda path: config)
 
     def stop(*args, **kwargs):

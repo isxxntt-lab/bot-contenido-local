@@ -10,7 +10,42 @@
   "twitch": {
     "juegos_top": 15,
     "categorias_fijas": ["Just Chatting", "IRL"],
-    "categorias_excluidas": ["Slots", "Virtual Casino", "Pools, Hot Tubs, and Beaches", "ASMR"]
+    "categorias_excluidas": ["Slots", "Virtual Casino", "Pools, Hot Tubs, and Beaches", "ASMR"],
+    "streamers_fijos": [
+      "auronplay",
+      "rubius",
+      "thegrefg",
+      "vegetta777",
+      "ibai",
+      "juansguarnizo",
+      "rivers_gg",
+      "elmariana",
+      "spreen",
+      "quackity",
+      "coscu",
+      "carreraaa",
+      "robleis"
+    ],
+    "recientes": {
+      "periodos": ["LAST_DAY", "LAST_WEEK"],
+      "por_streamer": 8,
+      "vistas_minimas": 0
+    },
+    "historicos": {
+      "activo": true,
+      "periodo": "ALL_TIME",
+      "por_streamer": 4,
+      "vistas_minimas": 50000
+    },
+    "min_clips": 2,
+    "min_clips_fijos": 1,
+    "helix": {
+      "activa": false
+    }
+  },
+  "asr": {
+    "hotwords_activa": false,
+    "hotwords": ["hostia", "joder", "mierda", "vamos", "no puede ser", "bro"]
   },
   "kick": {
     "streamers": ["westcol", "spreen", "davooxeneize", "lacobraaa", "elzeein", "robleis", "brunenger", "duendepablo"],
