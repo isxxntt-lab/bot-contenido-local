@@ -97,6 +97,19 @@ Entran porque existen y tienen clips: `auronplay`, `rubius`, `thegrefg`, `vegett
 `LAST_WEEK`, `LAST_MONTH` ni `ALL_TIME`; el canal con clips es `rubius`. Tampoco se
 añadieron `riversgg` ni `samyrivera` (cuentas sin clips).
 
+Con `seleccion.historia.activa` el corte no sale de la misma intervención para
+llegar al mínimo: pide unos 8 s de planteamiento y cerca de 32 s, y la duración
+se mide después de quitar silencios (25-50 s). Si no llega, el motivo es
+`historia corta`. Un clip de Twitch de menos de 25 s con VOD se baja como
+ventana `(offset - 20, duración + 35)` de `twitch.tv/videos/<id>`; el pico se
+busca solo dentro del clip original. Si el VOD falla, se usa el clip y queda
+anotado. En YouTube la ventana es 60 s desde 20 s antes del pico
+(`contexto_antes` / `contexto_segundos`). En Kick se guarda la duración si
+yt-dlp la trae; el listado plano no da VOD ni segundo, así que el clip se queda
+como está. El ranking, con la historia activa, juzga clips de todos los
+streamers fijos e históricos hasta `candidatos_por_ejecucion` y se queda el de
+mejor nota, uno por streamer. El reporte guarda gancho, desarrollo y payoff.
+
 `asr.hotwords_activa` está en false. Si se enciende, `transcribe` pasa a
 faster-whisper 1.2.1 una pista de como mucho 200 caracteres (la lista `asr.hotwords`
 y el nombre del streamer) y nunca junto a `prefix`. Apagado, la llamada no cambia.

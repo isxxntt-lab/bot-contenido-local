@@ -143,6 +143,9 @@ class Candidate:
     chat_rate: float | None = None
     historico: bool = False
     login: str | None = None
+    # Tramo del clip original dentro del archivo descargado (inicio, fin), en segundos.
+    clip_en_fuente: tuple[float, float] | None = None
+    nota_fuente: str | None = None
 
 
 @dataclass
@@ -328,6 +331,9 @@ def rank_clips(pool: list[Candidate]) -> list[Candidate]:
                 weights[id(candidate)] *= 1.2
             hottest = max(cluster, key=lambda candidate: weights[id(candidate)])
             weights[id(hottest)] *= 1.25
+    for candidate in pool:
+        if candidate.seconds is not None and candidate.seconds < 25:
+            weights[id(candidate)] *= 0.5
     return sorted(pool, key=lambda candidate: weights[id(candidate)], reverse=True)
 
 
@@ -692,18 +698,42 @@ def scout_kick(settings: dict) -> list[Candidate]:
             views = int(entry.get("view_count") or 0)
             if created is None or created < limit or views < minimum:
                 continue
-            found.append(
-                Candidate(
-                    platform="Kick",
-                    streamer=entry.get("channel") or entry.get("uploader") or name,
-                    title=entry.get("title") or "",
-                    views=views,
-                    url=entry["url"],
-                    key=f"kick-{entry['id']}",
-                    created=created,
-                )
-            )
+            found.append(_candidato_kick(entry, name, views, created))
     return sorted(found, key=lambda candidate: candidate.views, reverse=True)
+
+
+def _candidato_kick(entry: dict, name: str, views: int, created: datetime) -> Candidate:
+    """Clip de Kick. La duración se guarda si yt-dlp la trae.
+
+    El listado plano no da un VOD ni el segundo del clip, así que no se puede
+    abrir una ventana alrededor. Si algún día el info trae ``vod_id`` y
+    ``start_time``, se usaría igual que en Twitch.
+    """
+    seconds = None
+    raw = entry.get("duration")
+    if raw is not None:
+        try:
+            seconds = float(raw)
+        except (TypeError, ValueError):
+            seconds = None
+    vod = entry.get("vod_id") or entry.get("video_id")
+    offset = entry.get("start_time")
+    try:
+        offset = float(offset) if offset is not None else None
+    except (TypeError, ValueError):
+        offset = None
+    return Candidate(
+        platform="Kick",
+        streamer=entry.get("channel") or entry.get("uploader") or name,
+        title=entry.get("title") or "",
+        views=views,
+        url=entry["url"],
+        key=f"kick-{entry['id']}",
+        created=created,
+        seconds=seconds,
+        vod_id=str(vod) if vod else None,
+        offset=offset,
+    )
 
 
 def _heatmap_peak(info: dict) -> float | None:
@@ -745,7 +775,9 @@ def scout_youtube(settings: dict) -> list[Candidate]:
                 peak = _heatmap_peak(info)
                 if peak is None:
                     continue
-                start = max(0.0, peak - 4)
+                antes = float(settings.get("contexto_antes", 4))
+                largo = float(settings.get("contexto_segundos", YOUTUBE_SECTION))
+                start = max(0.0, peak - antes)
                 found.append(
                     Candidate(
                         platform="YouTube",
@@ -755,7 +787,9 @@ def scout_youtube(settings: dict) -> list[Candidate]:
                         url=info["webpage_url"],
                         key=f"youtube-{info['id']}-{int(start)}",
                         created=created,
-                        section=(start, YOUTUBE_SECTION),
+                        section=(start, largo),
+                        seconds=largo,
+                        nota_fuente="ventana del directo",
                     )
                 )
                 break
@@ -841,25 +875,37 @@ def clean_cache(days: int = CACHE_DAYS, keep_videos: int = 0) -> None:
                 path.unlink(missing_ok=True)
 
 
-def fetch_media(candidate: Candidate, cache_dir: Path | None = None) -> Path:
-    """Localiza el clip. Sin ``cache_dir`` descarga si falta; con él no sale de esa carpeta."""
-    directory = cache_dir if cache_dir is not None else CACHE_DIR
-    directory.mkdir(parents=True, exist_ok=True)
-    destination = directory / f"{_safe_name(candidate.key)}.mp4"
-    if destination.is_file() and destination.stat().st_size > 0:
-        return destination
-    if cache_dir is not None:
-        raise FileNotFoundError(f"no está en la caché pedida ({destination.name}); no se descarga")
+def ventana_vod(candidate: Candidate, antes: float = 20.0, extra: float = 35.0) -> tuple[str, tuple[float, float], tuple[float, float]] | None:
+    """Ventana del VOD alrededor del clip: (url, sección -ss/-t, recorte del clip).
+
+    La sección es (offset - antes, duración + extra) con el inicio en 0 si el
+    clip arranca antes de ``antes``. None si no hay VOD o el clip ya es largo.
+    """
+    if candidate.platform != "Twitch" or not candidate.vod_id or candidate.offset is None:
+        return None
+    duration = float(candidate.seconds or 0)
+    if duration >= 25:
+        return None
+    start = max(0.0, float(candidate.offset) - antes)
+    antes_real = float(candidate.offset) - start
+    length = antes_real + duration + max(0.0, extra - antes)
+    if length <= 0:
+        return None
+    recorte = (antes_real, antes_real + duration)
+    return f"https://www.twitch.tv/videos/{candidate.vod_id}", (start, length), recorte
+
+
+def _bajar_medio(url: str, section: tuple[float, float] | None, destination: Path) -> None:
     with _ytdlp({"format": "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]/b"}) as downloader:
-        info = downloader.extract_info(candidate.url, download=False)
+        info = downloader.extract_info(url, download=False)
     formats = info.get("requested_formats") or [info]
     command = [_ffmpeg_exe(), "-y", "-v", "error"]
     for media in formats:
         headers = media.get("http_headers") or {}
         if headers:
             command.extend(["-headers", "".join(f"{key}: {value}\r\n" for key, value in headers.items())])
-        if candidate.section:
-            start, length = candidate.section
+        if section:
+            start, length = section
             command.extend(["-ss", f"{start:.2f}", "-t", f"{length:.2f}"])
         command.extend(["-i", media["url"]])
     command.extend(
@@ -872,6 +918,45 @@ def fetch_media(candidate: Candidate, cache_dir: Path | None = None) -> Path:
     except RuntimeError:
         destination.unlink(missing_ok=True)
         raise
+
+
+def fetch_media(candidate: Candidate, cache_dir: Path | None = None, config: dict | None = None) -> Path:
+    """Localiza el clip. Sin ``cache_dir`` descarga si falta; con él no sale de esa carpeta.
+
+    Si la historia está activa y el clip de Twitch dura menos de 25 s, prueba
+    primero la ventana del VOD. Si esa descarga falla, se queda el clip y se anota.
+    """
+    directory = cache_dir if cache_dir is not None else CACHE_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    selection = narrative_segments.settings_from(config)
+    plan = ventana_vod(candidate, selection["vod_antes"], selection["vod_extra"]) if selection.get("historia_activa") else None
+    destination = directory / f"{_safe_name(candidate.key)}{'_vod' if plan else ''}.mp4"
+    if destination.is_file() and destination.stat().st_size > 0:
+        if plan is not None:
+            candidate.nota_fuente = "ventana de VOD"
+            candidate.clip_en_fuente = plan[2]
+        return destination
+    if cache_dir is not None:
+        raise FileNotFoundError(f"no está en la caché pedida ({destination.name}); no se descarga")
+    if plan is not None:
+        url, section, recorte = plan
+        try:
+            _bajar_medio(url, section, destination)
+        except Exception as exc:  # noqa: BLE001 - el VOD puede haber caducado
+            print(f"  Aviso: el VOD de @{candidate.streamer} no se pudo leer ({exc}). Se usa el clip.", file=sys.stderr)
+            candidate.nota_fuente = "VOD no disponible; se usa el clip"
+            candidate.clip_en_fuente = None
+            destination.unlink(missing_ok=True)
+            destination = directory / f"{_safe_name(candidate.key)}.mp4"
+        else:
+            candidate.nota_fuente = "ventana de VOD"
+            candidate.clip_en_fuente = recorte
+            return destination
+    elif candidate.section and candidate.platform == "YouTube":
+        candidate.nota_fuente = candidate.nota_fuente or "ventana del directo"
+    if destination.is_file() and destination.stat().st_size > 0:
+        return destination
+    _bajar_medio(candidate.url, candidate.section, destination)
     return destination
 
 
@@ -1027,10 +1112,24 @@ def _cut_points(cues: list[CaptionCue], total: float) -> tuple[list[float], list
     return starts, ends
 
 
-def find_peak(audio: np.ndarray, cues: list[CaptionCue]) -> float:
-    """Segundo del clip con el salto de sonido más fuerte, pesado por la reacción."""
+def find_peak(
+    audio: np.ndarray, cues: list[CaptionCue], inicio: float | None = None, fin: float | None = None
+) -> float:
+    """Segundo del clip con el salto de sonido más fuerte, pesado por la reacción.
+
+    Con inicio y fin, el pico solo se busca en ese tramo (el clip original
+    dentro de una ventana de VOD).
+    """
     _energy, spike, heat = _frame_scores(audio, cues)
-    return int(np.argmax(spike * (0.35 + heat))) * FRAME_STEP
+    score = spike * (0.35 + heat)
+    if inicio is None and fin is None:
+        return int(np.argmax(score)) * FRAME_STEP
+    frames = len(score)
+    lo = 0 if inicio is None else max(0, int(inicio / FRAME_STEP))
+    hi = frames if fin is None else min(frames, max(lo + 1, int(fin / FRAME_STEP) + 1))
+    if hi <= lo:
+        return int(np.argmax(score)) * FRAME_STEP
+    return (lo + int(np.argmax(score[lo:hi]))) * FRAME_STEP
 
 
 def choose_window(
@@ -1234,15 +1333,23 @@ def _tighten(
 
 
 def select_segment(
-    audio: np.ndarray, words: list[CaptionCue], config: dict
+    audio: np.ndarray,
+    words: list[CaptionCue],
+    config: dict,
+    rango_pico: tuple[float, float] | None = None,
 ) -> tuple[narrative_segments.Segment, float, list[CaptionCue], float, list[tuple[float, float]], clip_judge.Judgement]:
     """Tramo narrativo alrededor del pico, silencios entre frases quitados y nota del juez.
 
     Devuelve (segmento, duración final, subtítulos, pico relativo, cortes, juicio).
+    ``rango_pico`` limita la búsqueda del pico al clip original cuando el audio
+    es una ventana más larga del VOD. El tramo sí puede usar el contexto.
     """
     selection = narrative_segments.settings_from(config)
     total = len(audio) / SAMPLE_RATE
-    peak = find_peak(audio, words)
+    if rango_pico is None:
+        peak = find_peak(audio, words)
+    else:
+        peak = find_peak(audio, words, rango_pico[0], rango_pico[1])
     if words:
         segment = narrative_segments.segment_for_peak(words, peak, selection, total)
     else:
@@ -1260,6 +1367,13 @@ def select_segment(
         selection["silencio_corte"], selection["silencio_margen"], sentence_only=True,
     )
     judgement = clip_judge.judge(words, segment, length, config)
+    if selection.get("historia_activa") and length < float(selection.get("historia_minimo", 25)):
+        if "historia corta" not in segment.notes:
+            segment.notes.append("historia corta")
+        if not any("historia corta" in motivo for motivo in judgement.reasons):
+            judgement.reasons.append("historia corta")
+        judgement.accepted = False
+        judgement.decision = "rechazo"
     return segment, length, cues, rel_peak, cuts, judgement
 
 
@@ -1267,7 +1381,7 @@ def build_moment(
     candidate: Candidate, shortest: float, longest: float, language: str, config: dict | None = None,
     cache_dir: Path | None = None,
 ) -> Moment:
-    path = fetch_media(candidate, cache_dir)
+    path = fetch_media(candidate, cache_dir, config)
     audio = load_audio(path)
     if audio.size == 0:
         raise RuntimeError("el clip no tiene audio")
@@ -1285,7 +1399,9 @@ def build_moment(
             candidate, path, start, length, cues, peak, detect_layout(path, start, span), cuts,
             source_words=list(words),
         )
-    segment, length, cues, peak, cuts, judgement = select_segment(audio, words, config)
+    segment, length, cues, peak, cuts, judgement = select_segment(
+        audio, words, config, candidate.clip_en_fuente
+    )
     moment = Moment(candidate, path, segment.start, length, cues, peak, None, cuts, source_words=list(words))
     moment.segment = segment.to_dict()
     moment.judgement = judgement.to_dict()
@@ -1339,8 +1455,44 @@ def _log_moment(candidate: Candidate, moment: Moment | None, status: str, reason
             "duracion_final": round(moment.length, 2),
             "notas": moment.segment.get("notes", []),
         }
+    arco = explicar_arco(moment) if moment is not None else None
+    if arco:
+        entry["arco"] = arco
+    if candidate.nota_fuente:
+        entry["fuente_nota"] = candidate.nota_fuente
     _SELECTION_LOG.append(entry)
     return entry
+
+
+def explicar_arco(moment: Moment | None) -> dict | None:
+    """Gancho, desarrollo y payoff con los tiempos de la transcripción de origen."""
+    if moment is None:
+        return None
+    words = moment.source_words or []
+    start = moment.start
+    end = (moment.segment or {}).get("end", start + moment.length)
+    inside = [word for word in words if start - 0.05 <= word.start < end + 0.05]
+    if not inside:
+        return None
+    sentences = narrative_segments.split_sentences(inside, 0.6)
+    if not sentences:
+        return None
+
+    def pack(group: list) -> dict:
+        return {
+            "texto": " ".join(sentence.text for sentence in group).strip(),
+            "inicio": round(group[0].start, 2),
+            "fin": round(group[-1].end, 2),
+        }
+
+    if len(sentences) == 1:
+        return {"gancho": pack(sentences), "desarrollo": {"texto": "", "inicio": sentences[0].end, "fin": sentences[0].end}, "payoff": pack(sentences)}
+    medio = sentences[1:-1]
+    return {
+        "gancho": pack(sentences[:1]),
+        "desarrollo": pack(medio) if medio else {"texto": "", "inicio": round(sentences[0].end, 2), "fin": round(sentences[-1].start, 2)},
+        "payoff": pack(sentences[-1:]),
+    }
 
 
 def collect_moments(
@@ -1664,9 +1816,10 @@ def make_short(
     headline: str,
     destination: Path,
     extra_tags: list[str],
+    listo: list[Moment] | None = None,
 ) -> dict | None:
     first_log = len(_SELECTION_LOG)
-    moments = collect_moments(candidates, config, config.get("idioma", "es"))
+    moments = listo if listo else collect_moments(candidates, config, config.get("idioma", "es"))
     if not moments:
         print("  Ningún momento completo para este Short.", file=sys.stderr)
         return None
@@ -1683,6 +1836,9 @@ def make_short(
     post["clips"] = [candidate.key for candidate in unique]
     post["fuentes"] = [_fuente_reporte(candidate) for candidate in unique]
     post["seleccion"] = _SELECTION_LOG[first_log:]
+    arco = explicar_arco(moments[0])
+    if arco:
+        post["arco"] = arco
     post["cortes"], post["picos_short"] = _cut_info(moments)
     print(f"  Vídeo: {destination} ({post['duracion']}s, {destination.stat().st_size} bytes)")
     result = qa.run_qa(destination, config, destination.with_suffix(".ass"))
@@ -1904,7 +2060,67 @@ def sin_clips_publicados(candidates: list[Candidate], used: set[str]) -> list[Ca
 def _fuente_reporte(candidate: Candidate) -> dict:
     info = rights.source_info(candidate)
     info["historico"] = bool(candidate.historico)
+    if candidate.nota_fuente:
+        info["fuente_nota"] = candidate.nota_fuente
     return info
+
+
+def _reparto_por_streamer(candidates: list[Candidate], cupo: int) -> list[Candidate]:
+    """Un clip de cada streamer antes de repetir, para no evaluar solo a los más vistos."""
+    pools: dict[str, list[Candidate]] = {}
+    for candidate in candidates:
+        pools.setdefault(candidate.streamer, []).append(candidate)
+    for pool in pools.values():
+        pool.sort(key=lambda candidate: candidate.views, reverse=True)
+    names = sorted(pools, key=lambda name: pools[name][0].views, reverse=True)
+    picked: list[Candidate] = []
+    index = 0
+    while len(picked) < cupo and any(index < len(pools[name]) for name in names):
+        for name in names:
+            if index < len(pools[name]):
+                picked.append(pools[name][index])
+                if len(picked) >= cupo:
+                    break
+        index += 1
+    return picked
+
+
+def evaluar_por_juez(candidates: list[Candidate], config: dict, language: str) -> list[Moment]:
+    """Juzga hasta candidatos_por_ejecucion y devuelve los aceptados, mejor nota primero.
+
+    Como mucho uno por streamer: el de más puntuación.
+    """
+    selection = narrative_segments.settings_from(config)
+    cupo = int(selection.get("candidatos_por_ejecucion") or 12)
+    shortest = selection["segundos_min"]
+    longest = selection["segundos_max"]
+    accepted: dict[str, Moment] = {}
+    tried = 0
+    for candidate in _reparto_por_streamer(candidates, cupo):
+        if tried >= cupo:
+            break
+        decision = rights.check_candidate(candidate, config)
+        if not decision.allowed:
+            print(f"  Salto @{candidate.streamer} por derechos: {decision.reason}", file=sys.stderr)
+            continue
+        tried += 1
+        try:
+            moment = build_moment(candidate, shortest, longest, language, config)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  Salto @{candidate.streamer}: {exc}", file=sys.stderr)
+            _log_moment(candidate, None, "error", str(exc))
+            continue
+        verdict = moment.judgement or {}
+        if not verdict.get("aceptado", False):
+            _log_moment(candidate, moment, "descartado")
+            continue
+        _log_moment(candidate, moment, "aceptado")
+        name = candidate.streamer.casefold()
+        previous = accepted.get(name)
+        score = float(verdict.get("puntuacion") or 0)
+        if previous is None or score > float((previous.judgement or {}).get("puntuacion") or 0):
+            accepted[name] = moment
+    return sorted(accepted.values(), key=lambda moment: float((moment.judgement or {}).get("puntuacion") or 0), reverse=True)
 
 
 def ordenar_para_short(pool: list[Candidate], config: dict | None = None) -> list[Candidate]:
@@ -1927,11 +2143,17 @@ def ordenar_para_short(pool: list[Candidate], config: dict | None = None) -> lis
 
 
 def streamer_short(
-    pool: list[Candidate], name: str, config: dict, today: str, game: str | None = None
+    pool: list[Candidate],
+    name: str,
+    config: dict,
+    today: str,
+    game: str | None = None,
+    listo: list[Moment] | None = None,
 ) -> dict | None:
     """Short de un solo streamer: primero el pico de chat y de sonido, no el clip más largo."""
     name = pool[0].streamer if pool else name
-    pool = ordenar_para_short(pool, config)
+    if listo is None:
+        pool = ordenar_para_short(pool, config)
     recent_count = sum(not candidate.historico for candidate in pool)
     old_count = len(pool) - recent_count
     extra = f" y {old_count} histórico{'s' if old_count != 1 else ''}" if old_count else ""
@@ -1947,6 +2169,7 @@ def streamer_short(
     short = make_short(
         pool, config, title, headline,
         CLIPAZOS_DIR / f"streamer_{_safe_name(name).lower()}_{today}{_RUN_SUFFIX}.mp4", tags,
+        listo=listo,
     )
     if short:
         short["streamer"] = name
@@ -2091,6 +2314,28 @@ def main(argv: list[str] | None = None) -> int:
         short = streamer_short(pool, args.streamer.lstrip("@"), config, today)
         if short:
             report["shorts"].append(short)
+    elif not args.solo_radar and narrative_segments.settings_from(config).get("historia_activa"):
+        wanted = int(config.get("shorts_por_dia", 1))
+        recent = recently_posted(today, repeat_days)
+        fijos = set(plan["logins"])
+        pool = [
+            candidate for candidate in twitch
+            if candidate.historico or (candidate.login or candidate.streamer).casefold().lstrip("@") in fijos
+        ]
+        pool.extend(candidate for candidate in kick + youtube if candidate.streamer.casefold() not in (excluded | recent))
+        pool = [candidate for candidate in pool if candidate.streamer.casefold() not in (excluded | recent)]
+        print(f"\nRanking global: {len(pool)} clips de streamers fijos e históricos")
+        for moment in evaluar_por_juez(pool, config, language)[:wanted]:
+            name = moment.candidate.streamer
+            short = streamer_short([moment.candidate], name, config, today, listo=[moment])
+            if short:
+                if short.get("arco") is None and moment.source_words:
+                    arco = explicar_arco(moment)
+                    if arco:
+                        short["arco"] = arco
+                report["shorts"].append(short)
+        if not report["shorts"]:
+            print("\nNingún momento con historia completa.", file=sys.stderr)
     elif not args.solo_radar:
         wanted = int(config.get("shorts_por_dia", 1))
         recent = recently_posted(today, repeat_days)
