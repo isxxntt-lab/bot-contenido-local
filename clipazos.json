@@ -55,7 +55,9 @@
   },
   "youtube": {
     "canales": [],
-    "horas": 48
+    "horas": 48,
+    "contexto_antes": 20,
+    "contexto_segundos": 60
   },
   "radar": {
     "multiplicador": 2.0,
@@ -145,6 +147,16 @@
       "remate_min_segundos": 1.0,
       "min_palabras": 6,
       "obligatorios": ["inicio_completo", "final_completo", "remate", "duracion"]
+    },
+    "historia": {
+      "activa": true,
+      "planteamiento_segundos": 8,
+      "objetivo_segundos": 32,
+      "minimo_segundos": 25,
+      "maximo_segundos": 50,
+      "candidatos_por_ejecucion": 12,
+      "vod_antes": 20,
+      "vod_extra": 35
     }
   },
   "tiktok_export": {

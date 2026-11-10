@@ -23,6 +23,8 @@ Criterios:
   o remate; eso siguen midiéndolo final_completo (pausa o puntuación) y
   remate (tiempo y alguna palabra tras el pico).
 - duracion: la duración final está entre seleccion.segundos_min y segundos_max.
+- arco: informativo, peso 0. Al menos 3 frases, voz 6 s antes del pico y una
+  proporción de voz. No rechaza por sí solo.
 
 Es una heurística sobre la transcripción: no entiende el chiste ni el contexto.
 """
@@ -41,8 +43,10 @@ WEIGHTS = {
     "remate": 0.2,
     "autocontencion": 0.1,
     "duracion": 0.1,
-    # Peso 0: no cambia la media. El rechazo va aparte, en judge().
+    # Peso 0: no cambia la media. El rechazo de cierre_colgante va aparte.
     "cierre_colgante": 0.0,
+    # Peso 0 e informativo: no entra en el rechazo si no está en obligatorios.
+    "arco": 0.0,
 }
 
 DEFAULTS: dict = {
@@ -204,6 +208,18 @@ def judge(
         "cierre_colgante",
         0.0 if dangling else 1.0,
         f"la última palabra «{inside[-1].text.strip()}» no cierra" if dangling else "la última palabra no es un nexo colgado",
+    )
+    # arco: no mueve la nota. Sirve para leer en el reporte si había historia.
+    frases = int(segment.sentences or 0)
+    previos = [word for word in inside if word.start < segment.peak - 1e-3]
+    planteo = (segment.peak - previos[0].start) if previos else 0.0
+    voz = sum(max(0.0, word.end - word.start) for word in inside)
+    proporcion = (voz / duration) if duration > 0 else 0.0
+    arco_ok = frases >= 3 and planteo >= 6.0 and proporcion >= 0.35
+    put(
+        "arco",
+        1.0 if arco_ok else 0.0,
+        f"{frases} frases, {planteo:.1f} s antes del pico, voz {proporcion:.0%}",
     )
     # duración
     ok_length = selection["segundos_min"] <= duration <= selection["segundos_max"]
