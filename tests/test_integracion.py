@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import pytest
 
 import clipazos
+import entorno
 import publication_guard as pg
 import youtube_upload
 from conftest import ROOT, allowed_config
@@ -133,46 +134,21 @@ def test_upload_de_clipazos_en_dry_run_no_necesita_token(tmp_path, videos, monke
     clipazos._upload(config, path, None, dry_run=True)
 
 
-def test_collect_moments_no_descarga_sin_permiso(monkeypatch):
-    def boom(*args, **kwargs):
-        raise AssertionError("no debe descargar")
-
-    monkeypatch.setattr(clipazos, "build_moment", boom)
-    candidate = clipazos.Candidate("Twitch", "Nadie", "clip", 100, "u", "twitch-x")
-    assert clipazos.collect_moments([candidate], {}, "es") == []
-    assert clipazos.apply_rights([candidate], {}, "Twitch") == []
-
-
-def test_make_short_aplica_qa(tmp_path, videos, monkeypatch):
-    candidate = clipazos.Candidate("Twitch", "Ana", "clip", 100, "u", "twitch-a")
-    moments = [clipazos.Moment(candidate, videos["ok"], 0, 2.0, []), clipazos.Moment(candidate, videos["ok"], 2, 2.0, [])]
-    monkeypatch.setattr(clipazos, "collect_moments", lambda *a, **k: moments)
-
-    def fake_render(_moments, _title, _channel, destination):
-        shutil.copy(videos["horizontal"], destination)
-        shutil.copy(videos["ok"].with_suffix(".ass"), destination.with_suffix(".ass"))
-        return destination
-
-    monkeypatch.setattr(clipazos, "render_short", fake_render)
-    post = clipazos.make_short([candidate], {"qa": {"duracion_min": 1}}, [[("X", False)]], "Titular", tmp_path / "s.mp4", [])
-    assert post["no_subir"] is True and post["bloqueado_por"] == "qa"
-    assert post["clips"] == ["twitch-a"] and post["fuentes"][0]["streamer"] == "Ana"
-
-
-def test_main_dry_run_sin_red(tmp_path, monkeypatch):
+def test_main_dry_run_no_publica_ni_monta(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(entorno, "comprobar", lambda: entorno.InformeEntorno(True, version="7.1"))
     monkeypatch.setattr(clipazos, "CLIPAZOS_DIR", tmp_path)
-    monkeypatch.setattr(clipazos, "CACHE_DIR", tmp_path / "cache")
-    monkeypatch.setattr(clipazos, "RADAR_PATH", tmp_path / "radar.json")
-    candidate = clipazos.Candidate("Twitch", "Nadie", "clip", 100, "u", "twitch-x")
-    monkeypatch.setattr(clipazos, "scout_twitch", lambda *a: [candidate, candidate])
-    monkeypatch.setattr(clipazos, "scout_kick", lambda *a: [])
-    monkeypatch.setattr(clipazos, "scout_youtube", lambda *a: [])
-    monkeypatch.setattr(clipazos, "fetch_media", lambda *a: (_ for _ in ()).throw(AssertionError("descarga")))
+    subidas: list[object] = []
+    monkeypatch.setattr(clipazos, "_upload", lambda *a, **k: subidas.append(a))
     config_path = tmp_path / "clipazos.json"
     config_path.write_text(json.dumps({"canal": "Clipazos ES"}), encoding="utf-8")
-    assert clipazos.main(["--config", str(config_path), "--dry-run"]) == 1
-    assert (tmp_path / f"reporte_{datetime.now().strftime('%Y%m%d')}_dryrun.json").is_file()
-    assert clipazos.recently_posted("20991231", 99999) == set()
+    assert clipazos.main(["--config", str(config_path), "--dry-run"]) == 0
+    reporte = tmp_path / f"reporte_{datetime.now().strftime('%Y%m%d')}_dryrun.json"
+    data = json.loads(reporte.read_text(encoding="utf-8"))
+    assert data["estado"] == "en_construccion" and data["shorts"] == []
+    assert data["mensaje"] == clipazos.MENSAJE_CONSTRUCCION
+    assert subidas == []
+    assert list(tmp_path.glob("*.mp4")) == []
+    assert "en construcción" in capsys.readouterr().out
 
 
 def test_config_antigua_sigue_funcionando(tmp_path, videos):

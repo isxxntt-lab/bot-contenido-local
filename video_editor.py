@@ -1,7 +1,8 @@
-"""Utilidades de subtítulos ASS y FFmpeg que comparten clipazos.py y semanal.py.
+"""Utilidades de subtítulos ASS y FFmpeg.
 
-Formato vertical de los Shorts, estilo de la palabra activa, temporización de las
-palabras transcritas y llamadas a FFmpeg (el binario embebido de imageio-ffmpeg).
+Reloj ASS, ajuste de intervalos y el binario embebido de imageio-ffmpeg. El
+paquete ``base`` monta el vertical de curiosidades encima de esto. ``SPLIT_TOP``
+se conserva para el QA de los .ass antiguos con estilo CaptionSplit.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ OUTPUT_DIR = BASE_DIR / "output"
 
 FRAME_SIZE = (1080, 1920)
 FPS = 24
+# Altura de la webcam cuando el Short parte la imagen: cámara arriba, juego abajo.
+SPLIT_TOP = 840
 # Amarillo #FFFF00 en el orden BGR que usa el formato ASS.
 ACTIVE_ASS = "00FFFF"
 

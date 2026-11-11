@@ -1,31 +1,111 @@
 # Clipazos ES
 
-Bot local que monta Shorts verticales en español con los mejores clips de
-streamers de Twitch y Kick y de youtubers. Busca los clips, los transcribe,
-encuadra la webcam del streamer, quema subtítulos palabra a palabra y, si está
-activado, sube el resultado a YouTube Shorts.
+El canal deja los clips de streamers y pasa a vídeos de **datos curiosos**.
+Esta rama deja la base de edición y de subida lista, y aparta el código que
+solo servía para Twitch, Kick y los directos.
 
-## Archivos
+El formato nuevo (guion, voz, visuales) **está en construcción**. `clipazos.py`
+no publica: si el entorno puede montar, escribe un reporte vacío y termina.
+Guion, TTS y planos viven como esqueleto en `curiosidades/`.
 
-- `clipazos.py`: flujo diario. Localiza clips (Twitch, Kick y YouTube con `yt-dlp`),
-  transcribe con `faster-whisper`, detecta la cara con el modelo YuNet de
-  `assets/models/` y monta el Short con FFmpeg.
-- `video_editor.py`: utilidades comunes de subtítulos ASS y FFmpeg.
-- `youtube_upload.py`: subida a YouTube con la API oficial (OAuth).
-- `narrative_segments.py`: divide la transcripción en frases y unidades narrativas.
-- `clip_judge.py`: juez local que puntúa si un momento tiene arco completo.
-- `tiktok_export.py`: deja cada Short aprobado listo para subir a TikTok a mano.
-- `rights.py`: política de derechos (qué streamers y fuentes se pueden usar).
-- `qa.py`: control de calidad bloqueante del vídeo montado.
-- `publication_guard.py`: kill switch, cupos y duplicados de YouTube (SQLite).
-- `clipazos.json`: configuración (streamers de Kick, categorías de Twitch, canales
-  de YouTube, duración, privacidad de la subida, días que se guardan los vídeos...).
-- `run_clipazos.bat`: lanzador que usa el venv y guarda el log.
-- `autorizar_youtube.bat`: autoriza la cuenta de YouTube la primera vez.
+## Snapshot del bot de streamers
+
+La copia completa y ejecutable (merges de PR #2 y PR #3, y el WIP del juez
+contextual) es la rama **`archivo-streamers-20261111`**, en el commit
+`6d6870e7d08729c55aa7d7f039a3f4fae416cf59`. No hay un tag con ese nombre.
+
+`_archive/streamers/` es el recorte movido con `git mv` (el historial de cada
+archivo se conserva). Pytest no entra ahí. La config de aquel formato está en
+`_archive/streamers/clipazos.streamers.json`.
+
+## Qué se archivó
+
+Código que no reutiliza la base de curiosidades:
+
+| Pieza | Dónde quedó |
+| --- | --- |
+| Pipeline de clips (`Candidate`, `Moment`, `Layout`, Twitch/Kick/YouTube, radar, chat, picos, webcam) | `_archive/streamers/clipazos.py` |
+| Segmentos narrativos, juez contextual, paquete contextual, prueba privada | `_archive/streamers/` |
+| Política de derechos tal como estaba en la raíz | `_archive/streamers/rights.py` (la parte común que usa la subida está en `base/permisos.py`) |
+| Hotwords del ASR, margen de subtítulo de la webcam (`split_caption_margin_v`) | dentro del `clipazos.py` archivado |
+| Pruebas de ese formato, incluido `test_clip_judge.py` (solo hablaba con el segmentador) | `_archive/streamers/tests/` |
+| Secciones `twitch`, `kick`, `youtube`, `rights`, `seleccion`, `radar`, `asr` y `semanal` | solo en `clipazos.streamers.json` |
+
+`test_rights` (tres casos de `unknown_permission_policy = allow` fallaban a
+propósito) y `test_una_parada_ajena_con_un_post_no_se_adopta` se archivaron
+sin arreglarlos.
+
+## Qué se recicla
+
+| Pieza | Dónde vive |
+| --- | --- |
+| Subida a YouTube | `youtube_upload.py` (importa el permiso desde `base.permisos`) |
+| Autorización OAuth | `autorizar_youtube.bat` |
+| Kill switch, cupos y la base SQLite | `publication_guard.py`. El cupo `max_por_streamer_dia` y la columna `streamer` se quedan: ahí están los Shorts ya publicados. **TODO:** pasará a ser cupo por tema o serie. La base sigue en `data/publicaciones.sqlite3` (no se versiona y no se borra). |
+| QA bloqueante, caras opcionales | `qa.py` (`qa.caras.activa` sigue en false) |
+| Export TikTok | `tiktok_export.py`. `approval(short, juez=...)` usa el veredicto que se le pasa. Si no se pasa, mira `short["juez"]` y, si tampoco está, `short["seleccion"]` para los reportes viejos. |
+| FFmpeg `-/filter_complex`, reloj ASS | `entorno.py`, `video_editor.py` |
+| Marco de criterios y puntuación | `clip_judge.py` (ya no importa el segmentador de clips) |
+| Render, subtítulos, transcripción, textos, reporte | paquete `base/` |
+| Lanzador | `run_clipazos.bat` sigue llamando a `python clipazos.py` |
+
+### Dónde quedó cada función que salía de `clipazos.py`
+
+| Antes | Ahora |
+| --- | --- |
+| `load_config` | `base.configuracion.load_config` |
+| `transcribe`, `_whisper`, `_opciones_transcripcion` | `base.transcripcion.transcribir`, `_whisper`, `opciones_transcripcion` (sin hotwords de streamer) |
+| `write_short_captions`, `_live_caption_events`, `_pop` | `base.subtitulos.escribir_subtitulos` y `eventos_palabra` (el resalte y el margen salen de la config) |
+| `split_caption_margin_v` | archivada: era el margen de la webcam. La zona segura es `subtitulos.margen_superior` / `margen_inferior` |
+| `render_short`, `_assemble_cuts` | `base.render.render_pieza` y `plan_render` (visuales + voz, sin layout de directo) |
+| `_hashtag`, `post_text`, `_title_text` | `base.texto.hashtag` y `texto_publicacion` |
+| `_upload` | `base.publicacion.subir_reporte` y `clipazos._upload` |
+| `parse_args` (`--dry-run`, `--forzar`) y el reporte | `base.informe` y `clipazos.main` |
+| `sync_cues`, reloj ASS, binario de FFmpeg | siguen en `video_editor.py` |
+
+## API de la base (la que usará `curiosidades/`)
+
+```python
+from pathlib import Path
+from video_editor import CaptionCue
+from base.render import Pieza, Visual, render_pieza
+
+pieza = Pieza(
+    visuales=(Visual(Path("plano.jpg"), tipo="imagen"),),
+    voz=Path("voz.mp3"),
+    palabras=(CaptionCue("hola", 0.10, 0.42), CaptionCue("mundo", 0.42, 0.90)),
+    duracion=8.0,
+    titulo="¿Sabías que…?",
+)
+render_pieza(pieza, Path("output/clipazos/pieza.mp4"))  # lee clipazos.json
+```
+
+- `Pieza`: lista de visuales (imagen o vídeo), pista de voz y cues de palabra.
+  Los cues valen tanto si vienen de Edge TTS (WordBoundary) como de Whisper.
+- `render_pieza` / `plan_render`: vertical **1080x1920**. Cada plano cubre el
+  lienzo y se recorta al centro. El audio de los planos no se usa: suena la voz.
+- `plan_render` escribe el `.ass` y el grafo y devuelve el comando, sin ejecutar
+  FFmpeg. El grafo entra por `-/filter_complex` (`entorno.opcion_filtro_complejo`).
+- Subtítulos palabra a palabra en ASS. Fuente, tamaño, color de resalte
+  (BGR de ASS: amarillo `00FFFF`) y márgenes salen de `clipazos.json` → `subtitulos`.
+  Alineación 2: `margen_inferior` (480 px) deja libre la barra de Shorts/TikTok.
+  `margen_superior` (250 px) es el tope del bloque. No hay números sueltos en el render.
+- Calidad en `clipazos.json` → `render`: códec, preset, CRF, fps, bitrate,
+  `loudness_lufs` **-14**, true peak -1.5 y LRA 11 (`loudnorm`, el mismo criterio
+  que ya usaba el montaje). `qa.fps` del config activo es 30, igual que `render.fps`.
+- `base.transcripcion.transcribir` es el camino Whisper, por si no hay marcas
+  de WordBoundary. No envía hotwords.
+- `base.salida.registrar_exportacion(post, config, juez=veredicto)` exporta a
+  TikTok si el QA pasó y ese juez aprobó. No sube a YouTube.
+- `clipazos._upload(...)` sube un reporte ya escrito. `main` no lo llama.
+
+`curiosidades/README.md` describe el flujo previsto: guion (gancho + dato +
+explicación + cierre) → dos fuentes → Edge TTS → visuales con licencia →
+render → QA → juez → YouTube y TikTok.
 
 ## Instalación
 
-Python 3.11 o superior, en Windows (PowerShell), desde esta carpeta:
+Python 3.11 o superior, desde esta carpeta:
 
 ```powershell
 python -m venv .venv
@@ -37,209 +117,31 @@ pip install -r requirements.txt
 Comprobación rápida:
 
 ```powershell
-.\.venv\Scripts\python.exe -c "import clipazos, youtube_upload, publication_guard, rights, qa"
+.\.venv\Scripts\python.exe -c "import clipazos, base, curiosidades, youtube_upload, publication_guard, qa"
 ```
 
 ## Uso
 
 ```powershell
 .\run_clipazos.bat
-```
-
-El `.bat` activa `.venv`, ejecuta `clipazos.py` y deja los vídeos y los reportes
-en `output\clipazos\`. La última ejecución queda en `output\clipazos\ultimo_run.log`
-y todas se acumulan en `output\clipazos\historial.log`. La carpeta `output/` no se
-versiona.
-
-La tarea programada de Windows `BotContenidoLocal` lanza `run_clipazos.bat`
-automáticamente.
-
-### Prueba sin subir (`--dry-run`)
-
-```powershell
 .\.venv\Scripts\python.exe clipazos.py --dry-run
-.\.venv\Scripts\python.exe youtube_upload.py output\clipazos\reporte_20261109.json --dry-run
 ```
 
-`clipazos.py --dry-run` hace todo lo demás: busca clips, **descarga y monta** los
-permitidos, pasa derechos, QA, cupos y kill switch, pero no llama a la API de
-YouTube ni gasta cupo en la base. Los archivos llevan el sufijo `_dryrun`
-(`reporte_<fecha>_dryrun.json`, `streamer_<nombre>_<fecha>_dryrun.mp4`) para no pisar
-los de verdad, y no cuentan para «no repetir streamer». El radar sí se actualiza.
-`youtube_upload.py --dry-run` repite las comprobaciones sobre un reporte ya hecho
-sin tocar el reporte ni la base.
+El `.bat` activa `.venv`, ejecuta `clipazos.py` y deja el log en
+`output\clipazos\ultimo_run.log` (y lo acumula en `historial.log`). `output/`
+no se versiona.
 
-## Selección de momentos
+Hoy el modo por defecto, también con `--dry-run` o `--forzar`, **no publica**.
+Si FFmpeg o la fuente no valen, sale con código `entorno_no_apto` (2) y no
+escribe el reporte. Si el entorno es apto, el reporte
+`output/clipazos/reporte_<fecha>.json` queda en `en_construccion` y `shorts` vacío.
 
-Cada Short es **un solo momento completo** por defecto (`seleccion.max_momentos: 1`).
-Para cada clip candidato:
-
-1. Se transcribe con faster-whisper (tiempos por palabra) y se localiza el pico
-   (salto de sonido + palabras de reacción).
-2. `narrative_segments.py` agrupa las palabras en frases (puntuación final o pausa
-   de `pausa_frase` s) y en unidades narrativas (frases sin una pausa de
-   `pausa_unidad` s entre medias). El tramo parte de la frase del pico y suma
-   frases enteras hasta tener `preparacion_segundos` antes del pico y
-   `remate_segundos` después, sin salir de la unidad y entre `segundos_min` y
-   `segundos_max`. Una frase cortada por el borde del clip no se usa para
-   rellenar, y los bordes caen siempre entre palabras.
-3. Se quitan silencios solo entre frases (tras un punto, o si duran más del doble
-   de `silencio_corte`), dejando `silencio_margen` s de respiro.
-4. `clip_judge.py` puntúa el tramo de 0 a 1 y lo acepta o lo descarta.
-
-Se prueban como mucho `candidatos_a_evaluar` clips por Short (cada uno se descarga
-y se transcribe) y se queda el primero que aprueba el juez. Si ninguno lo aprueba,
-ese Short no se hace.
-
-### Juez local (`clip_judge.py`)
-
-Sin LLM ni red. Cada criterio da de 0 a 1 punto con un motivo:
-
-| Criterio | Peso | Qué mira |
-| --- | --- | --- |
-| `hook` | 0,2 | Voz desde el primer segundo y al menos `hook_palabras_min` palabras en los primeros `hook_segundos`. |
-| `inicio_completo` | 0,2 | Empieza al inicio de una frase, no con la voz del clip ya en marcha. |
-| `final_completo` | 0,2 | Acaba al cerrar una frase, no cortado por el final del clip. |
-| `remate` | 0,2 | Tras el pico quedan al menos `remate_min_segundos` y alguna palabra. |
-| `autocontencion` | 0,1 | No empieza con «y/pero/porque...», no acaba colgando en «de/que/el...», tiene `min_palabras`. |
-| `duracion` | 0,1 | La duración final está entre `segundos_min` y `segundos_max`. |
-
-Se descarta si falla un criterio de `juez.obligatorios` (por defecto inicio, final,
-remate y duración) o si la puntuación baja de `juez.puntuacion_min` (0,6). Cada
-momento evaluado queda en el reporte: en `"seleccion"` del Short y en
-`"seleccion"` del reporte (puntuación, criterios, motivos y estado `aceptado`,
-`descartado`, `no_unido` o `error`).
-
-### Varios momentos
-
-Con `max_momentos` mayor que 1 (o `--clips N`), solo se unen momentos de la misma
-historia: el mismo clip, o el mismo streamer y el mismo directo con el segundo
-justo a continuación del primero (hueco de como mucho `union_max_hueco_segundos`
-entre la última palabra de uno y la primera del otro). Si no, se usa uno solo.
-`segundos_objetivo` solo limita la suma en ese caso; `clips_maximos`,
-`segundos_min_clip` y `segundos_max_clip` ya no deciden la selección.
-
-## Exportación para TikTok
-
-Cada Short que aprueban el juez y el QA se copia también a
-`export_tiktok/<fecha>_<streamer>_<titulo>/` (en el PC:
-`C:\Users\pc\Proyecto Bot contenido\export_tiktok\`; con `--dry-run` la carpeta
-acaba en `_dryrun`). No se sube nada a TikTok:
-
-- `video.mp4`: el Short. Si no es ya H.264 + AAC 1080x1920 con faststart se
-  convierte y se verifica (ffprobe, o `ffmpeg -i` si no hay ffprobe); si algo falla
-  se copia el original tal cual.
-- `caption.txt`: título, clip y crédito al streamer original (con enlace) y los
-  hashtags, listo para pegar. Solo usa datos del pipeline.
-- `cover.jpg`: fotograma 1080x1920 del propio vídeo. Se prueban fotogramas
-  alrededor del pico (±`portada_ventana_segundos`) y repartidos por el vídeo; gana
-  el que tiene la cara más grande y clara (YuNet), luego la cercanía al pico y la
-  nitidez. Sin caras (o sin el modelo), el fotograma más nítido junto al pico.
-- `manifest.json`: id, streamer, plataforma, URL, tramos del corte, duración, nota
-  y motivos del juez, QA, segundo y método de la portada, fecha en Europe/Madrid,
-  rutas y estado de YouTube (subido, bloqueado por derechos o por la guardia,
-  pendiente o dry-run). Tras la subida se actualiza con el estado real.
-
-Además, cada export correcto (también con `--dry-run`) se copia entero a la
-carpeta visible `carpeta_visible`, por defecto `{DESKTOP}\\Clipazos TikTok`: el
-Escritorio real del usuario, que se pregunta a Windows al ejecutar (vale aunque esté
-en OneDrive y también desde la tarea programada). En este PC queda en
-`C:\Users\pc\Desktop\Clipazos TikTok\<misma carpeta>\`. Admite también `%VARIABLES%`,
-`~` o una ruta fija; vacío la desactiva. Si la copia falla se apunta en
-`copia_visible` del manifest y no afecta al export ni a YouTube. No se borra nada de
-`export_tiktok/`.
-
-Un fallo de exportación se apunta en el reporte (`tiktok_export`) y no frena la
-subida a YouTube. Config en el bloque `tiktok_export` (`enabled`, `carpeta`, `carpeta_visible`,
-`hashtags_base`, `max_hashtags`, `optimizar_video`, `portada_muestras`,
-`portada_ventana_segundos`, `timeout_segundos`). Para exportar un reporte ya hecho:
-`.\.venv\Scripts\python.exe tiktok_export.py output\clipazos\reporte_AAAAMMDD.json`.
-
-## Seguridad de publicación
-
-Orden en cada ejecución:
-
-1. **Derechos** (`rights.py`), antes de descargar o editar: los clips sin permiso
-   ni se descargan.
-2. **QA** (`qa.py`), después de montar: si falla, el Short queda en el reporte con
-   `"no_subir": true` y el motivo en `"qa"`.
-3. **Guardia** (`publication_guard.py`), antes de subir: kill switch, cupos y
-   duplicados. `youtube_upload.py` repite derechos + QA + guardia justo antes de la
-   API, también cuando se ejecuta por separado.
-
-### Bloque `publication`
-
-| Clave | Qué hace | Si falta |
-| --- | --- | --- |
-| `kill_switch` | `true` para cortar las subidas. La descarga y el montaje siguen. Se relee del disco antes de cada subida. | `false` |
-| `kill_switch_file` | Si existe este archivo en la carpeta (por defecto `STOP_YOUTUBE`), no se sube nada. | `STOP_YOUTUBE` |
-| `max_por_dia` | Subidas máximas por día (hora de Madrid). | 1 |
-| `max_por_ejecucion` | Subidas máximas en una misma ejecución. | 1 |
-| `max_por_streamer_dia` | Subidas máximas del mismo streamer al día. | 1 |
-| `zona_horaria` | Zona para contar los días. | `Europe/Madrid` |
-| `db_path` | Base SQLite de reservas y subidas (no se versiona). | `data/publicaciones.sqlite3` |
-
-La privacidad sale de `subida_youtube.privacidad`. Si falta o tiene un valor raro,
-se sube como `private`.
-
-Las reservas se guardan en SQLite con transacciones, así que dos procesos a la vez
-no se pasan del cupo y el estado sobrevive a un reinicio. Si la subida falla, la
-reserva se libera y no gasta cupo. Un clip (o el mismo MP4) que ya está subido o
-reservado no se vuelve a subir. Si el proceso muere a mitad de una subida, la
-reserva sigue contando porque no se sabe si el vídeo llegó a YouTube; se ve y se
-libera a mano:
+La subida del config activo está apagada (`subida_youtube.activa: false`).
+Para un reporte que ya exista:
 
 ```powershell
-.\.venv\Scripts\python.exe publication_guard.py --estado
-.\.venv\Scripts\python.exe publication_guard.py --liberar 12
+.\.venv\Scripts\python.exe youtube_upload.py output\clipazos\reporte_AAAAMMDD.json --dry-run
 ```
-
-### Bloque `rights`: política de derechos
-
-**Por defecto no se publica nada.** `unknown_permission_policy` es `"block"` y
-`rights.streamers` empieza vacío, así que todos los streamers tienen el permiso en
-`unknown` y sus clips se bloquean antes de descargarlos. Mientras no añadas
-streamers como `allowed`, cada ejecución termina sin Shorts (y `run_clipazos.bat`
-devuelve error, como cuando no hay clips).
-
-Para dar permiso a un streamer (solo si de verdad lo tienes):
-
-```json
-"streamers": {
-  "twitch:auronplay": {"estado": "allowed", "nota": "permiso por email del 10/11/2026"},
-  "kick:westcol": "allowed",
-  "elzeein": "denied"
-}
-```
-
-- Clave `"plataforma:nombre"` (solo esa plataforma) o `"nombre"` (cualquiera).
-- Estados: `allowed`, `unknown`, `denied`.
-- `blocked_streamers`, `allowed_sources` y `blocked_sources`: vetos directos.
-- `blocked_terms` y `blocked_patterns` (regex): bloquean por título o juego. Un
-  patrón mal escrito bloquea por seguridad.
-- `third_party_risk_terms`: señales de contenido de terceros (música, fútbol,
-  películas, reacciones...). Con `third_party_risk_policy: "block"` bloquean; con
-  `"warn"` solo avisan.
-
-Acreditar al streamer en la descripción no es lo mismo que tener permiso, y
-nada de esto evita un Content ID o un strike.
-
-### Bloque `qa`
-
-Bloquea la subida si falla algo, o si FFmpeg, ffprobe o YuNet no responden:
-
-- resolución `ancho`x`alto` (1080x1920) y `fps` (24 ± `fps_tolerancia`);
-- duración entre `duracion_min` y `duracion_max` segundos;
-- audio presente y sonoridad integrada entre `lufs_min` y `lufs_max` (EBU R128). El
-  montaje normaliza a -14 LUFS, así que el margen por defecto es de -18 a -10;
-- tramos negros de `negro_max_segundos` o más (blackdetect) y congelados de
-  `congelado_max_segundos` o más (freezedetect);
-- subtítulos: el `.ass` del Short existe y tiene al menos `subtitulos_min_eventos`
-  líneas;
-- caras con YuNet (`caras.activa`, apagado por defecto).
-
-Un `clipazos.json` antiguo sin estos bloques sigue funcionando: cada clave que
-falta toma un valor seguro.
 
 ## Pruebas
 
@@ -248,37 +150,18 @@ falta toma un valor seguro.
 .\.venv\Scripts\python.exe -m pytest -q tests
 ```
 
-Usan vídeos sintéticos generados con FFmpeg y una API de YouTube simulada: no
-descargan clips, no necesitan credenciales y no publican nada.
+No usan red ni credenciales. El render nuevo se comprueba mirando el comando y
+el `.ass`, sin FFmpeg. Las pruebas de QA, TikTok y el grafo mínimo sí usan el
+FFmpeg de `imageio-ffmpeg`. `tests/test_ffmpeg_real.py` se salta si no está
+`CLIPAZOS_FFMPEG_REAL=1` (descarga wheels). La carpeta `_archive` no entra en
+la colección.
 
-## Limitaciones
+## Publicación y credenciales
 
-- La selección nueva no se ha probado todavía con clips reales: solo con
-  transcripciones sintéticas. Conviene revisar los primeros Shorts y el bloque
-  `"seleccion"` del reporte antes de ajustar umbrales.
-- El juez es una heurística sobre la transcripción: no entiende el chiste ni si el
-  momento tiene gracia. Un clip sin voz (solo juego o música) se descarta.
-- Al ser un solo momento, habrá Shorts más cortos que antes y días sin Short si
-  ningún candidato tiene arco completo.
+La guardia (`publication_guard.py`) sigue con kill switch, cupos y la base
+SQLite. Un vídeo ya publicado no se vuelve a subir. La carpeta `credenciales/`
+(`client_secret.json`, `youtube_token.json`) y cualquier `.env` están en
+`.gitignore` y no se tocan.
 
-- Los permisos de `rights.streamers` los pones tú; el programa no verifica
-  licencias ni detecta música con derechos dentro del audio.
-- El QA mira la técnica del vídeo, no si el contenido es bueno.
-- La hora de Madrid se calcula con `zoneinfo`; en Windows sin el paquete `tzdata`
-  se usa la regla de horario de verano de la UE.
-- El kill switch frena las subidas nuevas, pero no cancela una que ya está en curso.
-
-## Subida a YouTube
-
-La subida está en `youtube_upload.py` y se controla con `subida_youtube` en
-`clipazos.json` (`activa` y `privacidad`).
-
-1. Crea en Google Cloud un cliente OAuth de tipo "App de escritorio" y guarda el
-   JSON como `credenciales\client_secret.json`.
-2. Ejecuta `autorizar_youtube.bat` una vez. El token queda en
-   `credenciales\youtube_token.json`.
-
-## Credenciales
-
-La carpeta `credenciales/` (con `client_secret.json` y `youtube_token.json`) y
-cualquier `.env` están en `.gitignore` y **no se suben nunca** a git.
+La primera autorización, cuando el formato publique, sigue siendo
+`autorizar_youtube.bat`.

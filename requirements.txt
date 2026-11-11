@@ -1,19 +1,27 @@
-# Clipazos ES: localizar clips de Twitch, Kick y YouTube sin claves.
+# Dependencias del proyecto. yt-dlp era del bot de streamers (archivado);
+# se queda para poder instalar el snapshot de la rama archivo-streamers-20261111.
+# Sin techo: un yt-dlp congelado deja de poder bajar clips cuando cambia la web.
 yt-dlp>=2026.10
 
-# Clipazos ES: transcripción local con tiempos por palabra.
+# Transcripción local con tiempos por palabra (la voz de curiosidades puede
+# venir también de Edge TTS; este paquete cubre el camino Whisper).
+# Sin techo: no hay una rotura conocida en esta línea de audio.
 faster-whisper>=1.2
 numpy>=2.0
 
-# Clipazos ES: detectar la webcam del streamer (modelo YuNet en assets/models).
+# YuNet queda para el QA opcional de caras (qa.caras, apagado) y la portada de TikTok.
+# Sin techo: la llamada a YuNet no depende de un cambio de CLI como FFmpeg.
 opencv-python-headless>=4.10
 
 # FFmpeg embebido para cortar, montar y quemar subtítulos (video_editor.py).
-imageio-ffmpeg>=0.6
+# 0.6 y 0.7 traen FFmpeg 7.x; 0.8 trae FFmpeg 9, que ya no acepta
+# -filter_complex_script. El montaje usa -/filter_complex (desde FFmpeg 7.0).
+# Techo <0.9: 0.8.1 está probado. Rollback: volver a -filter_complex_script y fijar <0.8.
+imageio-ffmpeg>=0.6,<0.9
 
-# Portadas y rótulos del resumen semanal (semanal.py).
+# Portadas del export de TikTok.
 pillow>=11.0
 
-# Clipazos ES: subida a YouTube Shorts con la API oficial gratuita.
+# Subida a YouTube Shorts con la API oficial gratuita.
 google-api-python-client>=2.150
 google-auth-oauthlib>=1.2

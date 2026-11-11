@@ -7,6 +7,10 @@ Decide si un Short se puede subir *ahora* y lo deja apuntado en una base SQLite:
   cada llamada a YouTube. Solo frena las subidas: la descarga y la edición siguen.
 - Cupos: máximo por día, por ejecución y por streamer y día. Los días se cuentan
   en hora de Madrid (Europe/Madrid).
+- TODO: el cupo por streamer (``max_por_streamer_dia`` y la columna ``streamer``)
+  pasará a ser un cupo por tema o serie en el formato de datos curiosos. No se
+  renombra ahora: la base ``data/publicaciones.sqlite3`` guarda los Shorts ya
+  publicados y hay que seguir pudiendo leerla.
 - Sin duplicados: un clip (o el mismo MP4) que ya está subido o reservado no se
   vuelve a subir.
 - Reservas en SQLite con transacciones ``BEGIN IMMEDIATE``: dos procesos a la vez
@@ -48,6 +52,8 @@ DEFAULTS: dict = {
     "kill_switch_file": "STOP_YOUTUBE",
     "max_por_dia": 1,
     "max_por_ejecucion": 1,
+    # TODO: max_por_streamer_dia pasará a ser cupo por tema/serie. La clave y la
+    # columna SQL se quedan para no romper la base de los Shorts ya publicados.
     "max_por_streamer_dia": 1,
     "zona_horaria": "Europe/Madrid",
     "db_path": "data/publicaciones.sqlite3",
@@ -431,6 +437,35 @@ class PublicationGuard:
     def release_publication(self, reservation_id: int, reason: str = "") -> None:
         """Devuelve el hueco: la subida falló o no se llegó a intentar."""
         self._set_status(reservation_id, "released", None, reason or "liberada")
+
+    def published_clip_keys(self) -> set[str]:
+        """Claves de clip reservadas o publicadas, sin el prefijo ``clip:``.
+
+        Sirve para no volver a usar un clip antiguo que ya salió, aunque el
+        reporte de aquel día ya no entre en ``no_repetir_dias``.
+        """
+        connection = self._connect(readonly=True)
+        if connection is None:
+            return set()
+        try:
+            rows = connection.execute(
+                "SELECT k.key FROM publication_keys k "
+                "JOIN publications p ON p.id = k.publication_id "
+                "WHERE p.status IN ('reserved', 'published')"
+            ).fetchall()
+        finally:
+            connection.close()
+        keys: set[str] = set()
+        for row in rows:
+            text = str(row["key"] or "").strip()
+            folded = text.casefold()
+            if folded.startswith("sha256:") or folded.startswith("video:"):
+                continue
+            if folded.startswith("clip:"):
+                text = text.split(":", 1)[1].strip()
+            if text:
+                keys.add(text.casefold())
+        return keys
 
     def rows(self, day: str | None = None) -> list[dict]:
         connection = self._connect(readonly=True)
