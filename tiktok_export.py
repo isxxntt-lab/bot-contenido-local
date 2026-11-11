@@ -31,9 +31,9 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
+import base.permisos as rights
 import publication_guard
 import qa
-import rights
 from video_editor import BASE_DIR, _ffmpeg_exe
 
 WIDTH, HEIGHT = 1080, 1920
@@ -177,10 +177,13 @@ def _run(command: list[str], timeout: float, binary: bool = False) -> subprocess
 
 
 def _short_streamer(short: dict) -> str:
-    if short.get("streamer"):
-        return str(short["streamer"])
+    """Nombre de carpeta: tema o serie del formato nuevo, o el streamer de un reporte viejo."""
+    for key in ("tema", "serie", "streamer"):
+        value = short.get(key)
+        if value:
+            return str(value)
     names = [source.get("streamer") for source in short.get("fuentes", []) if source.get("streamer")]
-    return names[0] if names else "streamer"
+    return names[0] if names else "pieza"
 
 
 # ---------------------------------------------------------------------------
@@ -469,14 +472,45 @@ def _judge_info(short: dict) -> list[dict]:
     ]
 
 
-def approval(short: dict) -> tuple[bool, str]:
-    """Solo se exportan Shorts que aprobaron el juez y el QA."""
+def _veredicto_aceptado(veredicto: object) -> bool:
+    """True si el juez que se le pasa dio el visto bueno.
+
+    Acepta un dict con ``aceptado``, un objeto con ``accepted`` (el
+    ``Judgement`` de clip_judge) o una lista de esos veredictos. Una lista
+    vacía no aprueba.
+    """
+    if veredicto is None:
+        return False
+    if isinstance(veredicto, dict):
+        if "aceptado" in veredicto:
+            return bool(veredicto.get("aceptado"))
+        if "accepted" in veredicto:
+            return bool(veredicto.get("accepted"))
+        return False
+    if isinstance(veredicto, (list, tuple)):
+        return any(_veredicto_aceptado(item) for item in veredicto)
+    accepted = getattr(veredicto, "accepted", None)
+    if accepted is not None:
+        return bool(accepted)
+    return False
+
+
+def approval(short: dict, juez: object | None = None) -> tuple[bool, str]:
+    """Solo se exporta si el QA pasó y el juez que se le pasa aprobó.
+
+    ``juez`` es el veredicto de quien llama (juez de guion, o el local). Si no
+    se pasa, se mira ``short['juez']`` y, en último caso, ``short['seleccion']``
+    para los reportes del formato de streamers que ya estaban en disco.
+    """
     result = short.get("qa") or {}
     if not result.get("ok"):
         return False, "el QA no aprobó el Short"
     if short.get("bloqueado_por") == "qa":
         return False, "el QA bloqueó el Short"
-    if not _judge_info(short):
+    veredicto = juez if juez is not None else short.get("juez")
+    if veredicto is None:
+        veredicto = short.get("seleccion")
+    if not _veredicto_aceptado(veredicto):
         return False, "ningún momento aprobado por el juez"
     video = Path(short.get("video") or "")
     if not video.is_file():
@@ -526,6 +560,7 @@ def export_short(
     dry_run: bool = False,
     root: Path | None = None,
     now: datetime | None = None,
+    juez: object | None = None,
 ) -> dict:
     """Crea la carpeta de exportación del Short. Devuelve el manifiesto.
 
@@ -533,7 +568,7 @@ def export_short(
     captura para no tocar la subida a YouTube.
     """
     settings = settings_from(config)
-    ok, reason = approval(short)
+    ok, reason = approval(short, juez)
     if not ok:
         raise ExportError(f"no se exporta: {reason}")
     when = madrid_now(now)

@@ -7,6 +7,10 @@ Decide si un Short se puede subir *ahora* y lo deja apuntado en una base SQLite:
   cada llamada a YouTube. Solo frena las subidas: la descarga y la edición siguen.
 - Cupos: máximo por día, por ejecución y por streamer y día. Los días se cuentan
   en hora de Madrid (Europe/Madrid).
+- TODO: el cupo por streamer (``max_por_streamer_dia`` y la columna ``streamer``)
+  pasará a ser un cupo por tema o serie en el formato de datos curiosos. No se
+  renombra ahora: la base ``data/publicaciones.sqlite3`` guarda los Shorts ya
+  publicados y hay que seguir pudiendo leerla.
 - Sin duplicados: un clip (o el mismo MP4) que ya está subido o reservado no se
   vuelve a subir.
 - Reservas en SQLite con transacciones ``BEGIN IMMEDIATE``: dos procesos a la vez
@@ -48,6 +52,8 @@ DEFAULTS: dict = {
     "kill_switch_file": "STOP_YOUTUBE",
     "max_por_dia": 1,
     "max_por_ejecucion": 1,
+    # TODO: max_por_streamer_dia pasará a ser cupo por tema/serie. La clave y la
+    # columna SQL se quedan para no romper la base de los Shorts ya publicados.
     "max_por_streamer_dia": 1,
     "zona_horaria": "Europe/Madrid",
     "db_path": "data/publicaciones.sqlite3",

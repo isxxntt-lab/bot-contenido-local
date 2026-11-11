@@ -4,7 +4,7 @@ Primera vez:  python youtube_upload.py --autorizar   (abre el navegador para ele
 Subir a mano: python youtube_upload.py output/clipazos/reporte_20261105.json
 Probar sin subir: python youtube_upload.py output/clipazos/reporte_20261105.json --dry-run
 
-Antes de cada subida se repiten las comprobaciones de derechos (rights.py) y de
+Antes de cada subida se repiten las comprobaciones de derechos (base.permisos) y de
 calidad (qa.py) y la guardia de publicación (publication_guard.py) aparta el hueco
 del cupo y relee el kill switch justo antes de llamar a la API.
 
@@ -20,9 +20,9 @@ import sys
 from pathlib import Path
 from typing import Callable
 
+import base.permisos as rights
 import publication_guard
 import qa
-import rights
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "clipazos.json"

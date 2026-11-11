@@ -18,6 +18,7 @@ output/
 *.tmp
 *.temp
 *.bak
+clipazos.json.bak_*
 .cache/
 tmp/
 temp/

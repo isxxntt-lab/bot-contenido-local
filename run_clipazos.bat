@@ -29,5 +29,5 @@ if not "%RESULTADO%"=="0" (
 )
 
 echo.
-echo Clipazos ES listo. Los vídeos están en output\clipazos.
+echo Clipazos ES terminó sin errores. El detalle está en output\clipazos\ultimo_run.log
 endlocal

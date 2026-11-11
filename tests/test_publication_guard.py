@@ -35,7 +35,10 @@ def test_defaults_seguros_y_privacidad():
 def test_clipazos_json_mantiene_la_privacidad_elegida():
     config = json.loads((ROOT / "clipazos.json").read_text(encoding="utf-8"))
     assert config["subida_youtube"]["privacidad"] == "public"
-    assert {"publication", "rights", "qa"} <= set(config)
+    assert {"publication", "qa"} <= set(config)
+    # El bloque rights era del formato de streamers; quedó en el JSON archivado.
+    assert "rights" not in config
+    assert config["publication"]["db_path"] == "data/publicaciones.sqlite3"
 
 
 def test_reserva_confirma_y_no_duplica(tmp_path):

@@ -105,16 +105,24 @@ def test_render_short_pasa_la_ruta_con_espacios_sin_la_opcion_vieja(tmp_path, mo
     def grabar(command):
         capturado["cmd"] = command
 
-    monkeypatch.setattr(clipazos, "_run_ffmpeg", grabar)
-    monkeypatch.setattr(clipazos, "_ffmpeg_exe", lambda: "ffmpeg-falso")
+    import base.render as render
+
+    monkeypatch.setattr(render, "_ejecutar", grabar)
+    monkeypatch.setattr(render, "_binario", lambda: "ffmpeg-falso")
     destino = tmp_path / "Proyecto Bot contenido" / "tmpé x" / "short final.mp4"
     destino.parent.mkdir(parents=True)
-    candidato = clipazos.Candidate("Prueba local", "TEST", "Título", 0, "local:test", "k")
-    momento = clipazos.Moment(
-        candidato, tmp_path / "clip.mp4", 0.0, 1.0, [CaptionCue("hola", 0.0, 0.4)],
-        layout=clipazos.Layout("blur", 16 / 9),
+    voz = tmp_path / "voz.wav"
+    voz.write_bytes(b"RIFF")
+    plano = tmp_path / "plano.png"
+    plano.write_bytes(b"png")
+    pieza = render.Pieza(
+        visuales=(render.Visual(plano, tipo="imagen"),),
+        voz=voz,
+        palabras=(CaptionCue("hola", 0.0, 0.4),),
+        duracion=1.0,
+        titulo="HOLA",
     )
-    clipazos.render_short([momento], [[("HOLA", True)]], "TEST", destino)
+    render.render_pieza(pieza, destino, {})
     comando = capturado["cmd"]
     assert "-filter_complex_script" not in comando
     indice = comando.index("-/filter_complex")
@@ -241,11 +249,6 @@ def test_main_se_para_antes_de_buscar_descargar_o_subir(tmp_path, monkeypatch):
         lambda: entorno.InformeEntorno(False, ("faltan los filtros ass",), version="9.0.2"),
     )
     llamadas: list[str] = []
-    monkeypatch.setattr(clipazos, "scout_twitch", lambda *a, **k: llamadas.append("scout"))
-    monkeypatch.setattr(clipazos, "scout_kick", lambda *a, **k: llamadas.append("kick"))
-    monkeypatch.setattr(clipazos, "scout_youtube", lambda *a, **k: llamadas.append("youtube"))
-    monkeypatch.setattr(clipazos, "fetch_media", lambda *a, **k: llamadas.append("descarga"))
-    monkeypatch.setattr(clipazos, "render_short", lambda *a, **k: llamadas.append("montaje"))
     monkeypatch.setattr(clipazos, "_upload", lambda *a, **k: llamadas.append("subida"))
     monkeypatch.setattr(clipazos, "CLIPAZOS_DIR", tmp_path)
     config = tmp_path / "clipazos.json"

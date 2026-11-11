@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 import numpy as np
 import pytest
 
-import clipazos
 import tiktok_export
+from base.salida import registrar_exportacion
 from conftest import ROOT, allowed_config, make_video
 from video_editor import _ffmpeg_exe
 
@@ -204,78 +204,73 @@ def test_config_real_tiene_bloque_tiktok():
     assert "export_tiktok/" in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
 
 
-# --- Integración con clipazos.make_short -------------------------------------------------
+# --- Cierre de una pieza: el juez se pasa, no se lee solo de seleccion ------------
 
 
-ALLOWED = {"rights": {"streamers": {"ana": "allowed"}}, "qa": {"duracion_min": 1}}
+JUEZ_OK = {"aceptado": True, "puntuacion": 0.9, "motivos": [], "criterios": {}}
 
 
-def _prepare_make_short(monkeypatch, videos):
-    def fake_moment(candidate, *args, **kwargs):
-        moment = clipazos.Moment(candidate, ROOT / "x.mp4", 0.5, 3.5, [], peak=1.5, cuts=[(0.5, 4.0)])
-        moment.segment = {"end": 4.0, "first_word_start": 0.6, "last_word_end": 3.9, "notes": []}
-        moment.judgement = {"aceptado": True, "puntuacion": 0.9, "motivos": [], "criterios": {}}
-        return moment
-
-    def fake_render(moments, _title, _channel, destination):
-        shutil.copy(videos["ok"], destination)
-        shutil.copy(videos["ok"].with_suffix(".ass"), destination.with_suffix(".ass"))
-        return destination
-
-    monkeypatch.setattr(clipazos, "build_moment", fake_moment)
-    monkeypatch.setattr(clipazos, "render_short", fake_render)
-    clipazos._SELECTION_LOG.clear()
+def _pieza(videos, tmp_path) -> dict:
+    target = tmp_path / "pieza.mp4"
+    shutil.copy(videos["ok"], target)
+    return {
+        "titulo": "Un dato curioso",
+        "descripcion": "Explicación con dos fuentes.",
+        "hashtags": ["#curiosidades"],
+        "video": str(target),
+        "duracion": 4.0,
+        "qa": {"ok": True, "motivos": []},
+        "tema": "Gatos",
+        "fuentes": [],
+    }
 
 
-def _candidate():
-    return clipazos.Candidate("Twitch", "Ana", "Momentazo", 1000, "https://clips.twitch.tv/m", "twitch-m")
+def test_el_juez_que_se_pasa_manda_sobre_seleccion():
+    corto = {"qa": {"ok": True}, "seleccion": [{"aceptado": False}], "video": "no-existe.mp4"}
+    assert "juez" in tiktok_export.approval(corto)[1]
+    ok, motivo = tiktok_export.approval(corto, juez=JUEZ_OK)
+    assert not ok and "no existe" in motivo
 
 
-def test_make_short_exporta_si_aprueba_juez_y_qa(tmp_path, videos, monkeypatch):
-    _prepare_make_short(monkeypatch, videos)
-    post = clipazos.make_short([_candidate()], ALLOWED, [[("X", False)]], "Lo mejor de Ana", tmp_path / "s.mp4", [])
+def test_exporta_si_el_juez_pasado_y_el_qa_aprueban(tmp_path, videos):
+    post = registrar_exportacion(_pieza(videos, tmp_path), {}, juez=JUEZ_OK)
     assert post["tiktok_export"]["estado"] == "ok"
     folder = tmp_path / "export_tiktok"
     exported = list(folder.iterdir())
     assert len(exported) == 1 and (exported[0] / "cover.jpg").is_file()
-    assert post["picos_short"] == [1.5] and post["cortes"][0]["trozos_clip"] == [[0.5, 4.0]]
-    manifest = json.loads((exported[0] / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["cortes"][0]["inicio_clip"] == 0.5
+    assert "gatos" in exported[0].name
 
 
 def test_fallo_de_export_no_rompe_el_flujo(tmp_path, videos, monkeypatch):
-    _prepare_make_short(monkeypatch, videos)
-
     def broken(*args, **kwargs):
         raise OSError("disco lleno")
 
     monkeypatch.setattr(tiktok_export, "export_short", broken)
-    post = clipazos.make_short([_candidate()], ALLOWED, [[("X", False)]], "T", tmp_path / "s.mp4", [])
-    assert post is not None and post["qa"]["ok"] is True
+    post = registrar_exportacion(_pieza(videos, tmp_path), {}, juez=JUEZ_OK)
+    assert post["qa"]["ok"] is True
     assert post["tiktok_export"] == {"estado": "error", "motivo": "disco lleno"}
     assert "no_subir" not in post
 
 
 def test_no_exporta_si_qa_falla(tmp_path, videos, monkeypatch):
-    _prepare_make_short(monkeypatch, videos)
     called = []
     monkeypatch.setattr(tiktok_export, "export_short", lambda *a, **k: called.append(1))
-    config = {**ALLOWED, "qa": {"duracion_min": 30}}
-    post = clipazos.make_short([_candidate()], config, [[("X", False)]], "T", tmp_path / "s.mp4", [])
-    assert post["no_subir"] is True and not called and "tiktok_export" not in post
+    post = _pieza(videos, tmp_path)
+    post["qa"] = {"ok": False, "motivos": ["negro"]}
+    post = registrar_exportacion(post, {}, juez=JUEZ_OK)
+    assert post["no_subir"] is True and post["bloqueado_por"] == "qa"
+    assert not called and "tiktok_export" not in post
 
 
-def test_exporta_en_dry_run(tmp_path, videos, monkeypatch):
-    _prepare_make_short(monkeypatch, videos)
-    monkeypatch.setattr(clipazos, "_RUN_SUFFIX", clipazos.DRY_RUN_SUFFIX)
-    post = clipazos.make_short([_candidate()], ALLOWED, [[("X", False)]], "T", tmp_path / "s.mp4", [])
+def test_exporta_en_dry_run(tmp_path, videos):
+    post = registrar_exportacion(_pieza(videos, tmp_path), {}, dry_run=True, juez=JUEZ_OK)
     assert post["tiktok_export"]["carpeta"].endswith("_dryrun")
 
 
-def test_export_desactivado(tmp_path, videos, monkeypatch):
-    _prepare_make_short(monkeypatch, videos)
-    config = {**ALLOWED, "tiktok_export": {"enabled": False}}
-    post = clipazos.make_short([_candidate()], config, [[("X", False)]], "T", tmp_path / "s.mp4", [])
+def test_export_desactivado(tmp_path, videos):
+    post = registrar_exportacion(
+        _pieza(videos, tmp_path), {"tiktok_export": {"enabled": False}}, juez=JUEZ_OK,
+    )
     assert "tiktok_export" not in post and not (tmp_path / "export_tiktok").exists()
 
 
