@@ -1,26 +1,93 @@
 {
   "canal": "Clipazos ES",
   "idioma": "es",
-  "shorts_por_dia": 1,
+  "shorts_por_dia": 3,
   "no_repetir_dias": 2,
-  "segundos_objetivo": 40,
+  "segundos_objetivo": 35,
   "clips_maximos": 5,
-  "segundos_min_clip": 6,
-  "segundos_max_clip": 22,
+  "segundos_min_clip": 20,
+  "segundos_max_clip": 50,
   "twitch": {
     "juegos_top": 15,
-    "categorias_fijas": ["Just Chatting", "IRL"],
-    "categorias_excluidas": ["Slots", "Virtual Casino", "Pools, Hot Tubs, and Beaches", "ASMR"]
+    "categorias_fijas": [
+      "Just Chatting",
+      "IRL"
+    ],
+    "categorias_excluidas": [
+      "Slots",
+      "Virtual Casino",
+      "Pools, Hot Tubs, and Beaches",
+      "ASMR"
+    ],
+    "streamers_fijos": [
+      "auronplay",
+      "rubius",
+      "thegrefg",
+      "vegetta777",
+      "ibai",
+      "juansguarnizo",
+      "rivers_gg",
+      "elmariana",
+      "spreen",
+      "quackity",
+      "coscu",
+      "carreraaa",
+      "robleis"
+    ],
+    "recientes": {
+      "periodos": [
+        "LAST_DAY",
+        "LAST_WEEK"
+      ],
+      "por_streamer": 8,
+      "vistas_minimas": 0
+    },
+    "historicos": {
+      "activo": true,
+      "periodo": "ALL_TIME",
+      "por_streamer": 4,
+      "vistas_minimas": 50000
+    },
+    "min_clips": 2,
+    "min_clips_fijos": 1,
+    "helix": {
+      "activa": false
+    },
+    "contexto_vod": {
+      "activa": true
+    }
+  },
+  "asr": {
+    "hotwords_activa": false,
+    "hotwords": [
+      "hostia",
+      "joder",
+      "mierda",
+      "vamos",
+      "no puede ser",
+      "bro"
+    ]
   },
   "kick": {
-    "streamers": ["westcol", "spreen", "davooxeneize", "lacobraaa", "elzeein", "robleis", "brunenger", "duendepablo"],
+    "streamers": [
+      "westcol",
+      "spreen",
+      "davooxeneize",
+      "lacobraaa",
+      "elzeein",
+      "robleis",
+      "brunenger",
+      "duendepablo"
+    ],
     "horas": 48,
     "vistas_minimas": 20,
     "shorts_por_dia": 1
   },
   "youtube": {
     "canales": [],
-    "horas": 48
+    "horas": 48,
+    "contexto_antes": 20,
+    "contexto_segundos": 60
   },
   "radar": {
     "multiplicador": 2.0,
@@ -28,7 +95,9 @@
     "dias_historial": 14
   },
   "semanal": {
-    "streamers": ["auronplay"],
+    "streamers": [
+      "auronplay"
+    ],
     "minutos": 20,
     "contexto_antes": 50,
     "contexto_despues": 30,
@@ -54,14 +123,52 @@
     "db_path": "data/publicaciones.sqlite3"
   },
   "rights": {
-    "unknown_permission_policy": "block",
-    "allowed_sources": ["Twitch", "Kick", "YouTube"],
+    "unknown_permission_policy": "allow",
+    "allowed_sources": [
+      "Twitch",
+      "Kick",
+      "YouTube"
+    ],
     "blocked_sources": [],
     "blocked_streamers": [],
     "streamers": {},
-    "blocked_terms": ["casino", "apuestas", "slots", "nsfw", "+18"],
+    "blocked_terms": [
+      "casino",
+      "apuestas",
+      "slots",
+      "nsfw",
+      "+18"
+    ],
     "blocked_patterns": [],
-    "third_party_risk_terms": ["música", "canción", "concierto", "videoclip", "película", "pelicula", "serie", "trailer", "tráiler", "partido", "fútbol", "futbol", "champions", "laliga", "la liga", "mundial", "dazn", "netflix", "hbo", "disney", "anime", "dmca", "copyright", "reacciona", "reaccionando", "reacción a", "watch party"],
+    "third_party_risk_terms": [
+      "música",
+      "canción",
+      "concierto",
+      "videoclip",
+      "película",
+      "pelicula",
+      "serie",
+      "trailer",
+      "tráiler",
+      "partido",
+      "fútbol",
+      "futbol",
+      "champions",
+      "laliga",
+      "la liga",
+      "mundial",
+      "dazn",
+      "netflix",
+      "hbo",
+      "disney",
+      "anime",
+      "dmca",
+      "copyright",
+      "reacciona",
+      "reaccionando",
+      "reacción a",
+      "watch party"
+    ],
     "third_party_risk_policy": "block"
   },
   "qa": {
@@ -70,12 +177,12 @@
     "alto": 1920,
     "fps": 24,
     "fps_tolerancia": 0.5,
-    "duracion_min": 10,
+    "duracion_min": 25,
     "duracion_max": 180,
     "lufs_min": -18,
     "lufs_max": -10,
     "negro_max_segundos": 1.0,
-    "negro_umbral_pixel": 0.10,
+    "negro_umbral_pixel": 0.1,
     "congelado_max_segundos": 2.0,
     "congelado_ruido_db": -60,
     "subtitulos_obligatorios": true,
@@ -90,33 +197,56 @@
   },
   "seleccion": {
     "max_momentos": 1,
-    "candidatos_a_evaluar": 4,
-    "segundos_min": 10,
-    "segundos_max": 45,
+    "candidatos_a_evaluar": 16,
+    "segundos_min": 25,
+    "segundos_max": 50,
     "preparacion_segundos": 3.0,
     "remate_segundos": 2.0,
     "pausa_frase": 0.6,
-    "pausa_unidad": 1.5,
+    "pausa_unidad": 4.0,
     "margen_inicio": 0.15,
     "margen_final": 0.35,
-    "silencio_corte": 1.0,
+    "silencio_corte": 3.5,
     "silencio_margen": 0.3,
     "union_max_hueco_segundos": 5.0,
     "borde_clip_segundos": 0.3,
     "juez": {
-      "puntuacion_min": 0.6,
+      "puntuacion_min": 0.9,
       "hook_segundos": 3.0,
       "hook_palabras_min": 3,
       "remate_min_segundos": 1.0,
       "min_palabras": 6,
-      "obligatorios": ["inicio_completo", "final_completo", "remate", "duracion"]
+      "obligatorios": [
+        "hook",
+        "inicio_completo",
+        "final_completo",
+        "remate",
+        "autocontencion",
+        "cierre_colgante",
+        "duracion"
+      ]
+    },
+    "historia": {
+      "activa": true,
+      "planteamiento_segundos": 8,
+      "objetivo_segundos": 32,
+      "minimo_segundos": 25,
+      "maximo_segundos": 50,
+      "candidatos_por_ejecucion": 12,
+      "vod_antes": 20,
+      "vod_extra": 35
     }
   },
   "tiktok_export": {
     "enabled": true,
     "carpeta": "export_tiktok",
     "carpeta_visible": "{DESKTOP}\\Clipazos TikTok",
-    "hashtags_base": ["#clipazos", "#streamers", "#clipsespañol", "#fyp"],
+    "hashtags_base": [
+      "#clipazos",
+      "#streamers",
+      "#clipsespañol",
+      "#fyp"
+    ],
     "max_hashtags": 10,
     "optimizar_video": true,
     "portada_muestras": 9,

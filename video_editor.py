@@ -18,6 +18,8 @@ OUTPUT_DIR = BASE_DIR / "output"
 
 FRAME_SIZE = (1080, 1920)
 FPS = 24
+# Altura de la webcam cuando el Short parte la imagen: cámara arriba, juego abajo.
+SPLIT_TOP = 840
 # Amarillo #FFFF00 en el orden BGR que usa el formato ASS.
 ACTIVE_ASS = "00FFFF"
 

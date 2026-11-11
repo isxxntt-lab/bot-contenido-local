@@ -56,7 +56,22 @@ def settings_from(config: dict | None) -> dict:
     settings["candidatos_a_evaluar"] = max(1, settings["candidatos_a_evaluar"])
     if settings["segundos_max"] < settings["segundos_min"]:
         settings["segundos_max"] = settings["segundos_min"]
+    historia = raw.get("historia") if isinstance(raw.get("historia"), dict) else {}
+    settings["historia_activa"] = historia.get("activa") is True
+    settings["historia_planteamiento"] = _suave(historia.get("planteamiento_segundos"), 8.0)
+    settings["historia_objetivo"] = _suave(historia.get("objetivo_segundos"), 32.0)
+    settings["historia_minimo"] = _suave(historia.get("minimo_segundos"), 25.0)
+    settings["historia_maximo"] = _suave(historia.get("maximo_segundos"), 50.0)
+    settings["candidatos_por_ejecucion"] = max(1, int(_suave(historia.get("candidatos_por_ejecucion"), 12)))
+    settings["vod_antes"] = _suave(historia.get("vod_antes"), 20.0)
+    settings["vod_extra"] = _suave(historia.get("vod_extra"), 35.0)
     return settings
+
+
+def _suave(value, default: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return float(default)
+    return float(value)
 
 
 @dataclass
@@ -116,8 +131,8 @@ def split_sentences(
     """Frases por puntuación final o pausa larga.
 
     La primera frase está «abierta» si la voz ya sonaba al empezar el clip (empieza
-    a menos de ``edge`` segundos del inicio) y la última si el clip la corta (sin
-    puntuación y a menos de ``edge`` segundos del final).
+    a menos de ``edge`` segundos del inicio). La última solo está cerrada si tiene
+    puntuación: el silencio que queda al final del archivo no es un punto.
     """
     sentences: list[Sentence] = []
     first = 0
@@ -131,7 +146,7 @@ def split_sentences(
                 Sentence(
                     first, index, chunk[0].start, chunk[-1].end,
                     " ".join(item.text.strip() for item in chunk),
-                    closed=punctuated or following is not None or (total is not None and total - word.end >= edge),
+                    closed=punctuated or following is not None,
                     clean_start=bool(first > 0 or chunk[0].start >= edge),
                 )
             )
@@ -227,6 +242,10 @@ def segment_for_peak(
         and span(first, last + 1) <= maximum
     ):
         last += 1
+    # Con historia activa no se sale de la intervención para rellenar el mínimo.
+    if s.get("historia_activa") is True:
+        return _segmento_historia(words, sentences, units, peak, s, total, first, last, home, notes, usable)
+
     # Duración mínima: primero la misma unidad, después las vecinas.
     crosses = False
     for same_unit_only in (True, False):
@@ -266,6 +285,96 @@ def segment_for_peak(
         complete_end=bool(complete_end),
         sentences=last - first + 1,
         crosses_units=crosses,
+        notes=notes,
+    )
+
+
+def _duracion_hablada(sentences: list[Sentence], first: int, last: int, s: dict) -> float:
+    """Lo que quedaría tras quitar silencios largos, como hace _tighten."""
+    cut = float(s.get("silencio_corte", 1.0))
+    keep = float(s.get("silencio_margen", 0.3))
+    total = sentences[first].end - sentences[first].start
+    for index in range(first, last):
+        gap = sentences[index + 1].start - sentences[index].end
+        total += keep if gap > cut else max(0.0, gap)
+        total += sentences[index + 1].end - sentences[index + 1].start
+    total += float(s.get("margen_inicio", 0.0)) + float(s.get("margen_final", 0.0))
+    return total
+
+
+def _segmento_historia(words, sentences, units, peak, s, total, first, last, home, notes, usable) -> Segment:
+    """Misma intervención: planteamiento antes del pico y luego el remate.
+
+    No junta otra unidad para llegar al mínimo. La duración que importa es la
+    de después de quitar silencios: si no llega a historia_minimo, se anota
+    «historia corta» y el juez lo rechaza.
+    """
+    planteamiento = float(s.get("historia_planteamiento", 8.0))
+    objetivo = float(s.get("historia_objetivo", 32.0))
+    minimo = float(s.get("historia_minimo", 25.0))
+    maximum = min(float(s["segundos_max"]), float(s.get("historia_maximo", s["segundos_max"])))
+
+    def span(a: int, b: int) -> float:
+        return sentences[b].end - sentences[a].start
+
+    def cabe(a: int, b: int) -> bool:
+        return span(a, b) <= maximum
+
+    while (
+        first > 0
+        and _unit_of(units, first - 1) == home
+        and usable(first - 1)
+        and peak - sentences[first].start < planteamiento
+        and cabe(first - 1, last)
+    ):
+        first -= 1
+    while (
+        last + 1 < len(sentences)
+        and _unit_of(units, last + 1) == home
+        and usable(last + 1)
+        and span(first, last) < objetivo
+        and cabe(first, last + 1)
+    ):
+        last += 1
+    while (
+        first > 0
+        and _unit_of(units, first - 1) == home
+        and usable(first - 1)
+        and span(first, last) < objetivo
+        and cabe(first - 1, last)
+    ):
+        first -= 1
+    while _duracion_hablada(sentences, first, last, s) < minimo:
+        if (
+            last + 1 < len(sentences)
+            and _unit_of(units, last + 1) == home
+            and usable(last + 1)
+            and cabe(first, last + 1)
+        ):
+            last += 1
+            continue
+        if (
+            first > 0
+            and _unit_of(units, first - 1) == home
+            and usable(first - 1)
+            and cabe(first - 1, last)
+        ):
+            first -= 1
+            continue
+        break
+    if _duracion_hablada(sentences, first, last, s) < minimo:
+        notes.append("historia corta")
+    first_word = sentences[first].first
+    last_word = sentences[last].last
+    start, end = _edges(words, first_word, last_word, s, total)
+    return Segment(
+        start, end, peak, first_word, last_word,
+        first_word_start=words[first_word].start,
+        last_word_end=words[last_word].end,
+        complete_start=bool(sentences[first].clean_start),
+        complete_end=bool(sentences[last].closed),
+        sentences=last - first + 1,
+        crosses_units=False,
         notes=notes,
     )
 

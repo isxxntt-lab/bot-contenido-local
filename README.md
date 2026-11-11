@@ -69,6 +69,51 @@ los de verdad, y no cuentan para «no repetir streamer». El radar sí se actual
 `youtube_upload.py --dry-run` repite las comprobaciones sobre un reporte ya hecho
 sin tocar el reporte ni la base.
 
+## Twitch: streamers fijos e históricos
+
+Además de las categorías (`scout_twitch`, periodo `LAST_DAY`), `scout_twitch_streamers`
+pide clips de `twitch.streamers_fijos` con la misma GQL pública, sin claves:
+
+- Recientes: `twitch.recientes.periodos` (`LAST_DAY` y `LAST_WEEK`), `por_streamer` y `vistas_minimas`.
+- Históricos: `twitch.historicos` (`activo`, `periodo` `LAST_MONTH` o `ALL_TIME`, `por_streamer`, `vistas_minimas`).
+  Si `activo` es false, no se piden. En el reporte quedan en `"historicos"` y, si uno
+  llega al Short, en la fuente y en `"seleccion"` con `"historico": true`.
+- Se juntan con los de categoría, se quedan una vez por slug y, si el clip trae VOD,
+  también por `vod_id` + segundo de inicio (a 5 s). `attach_chat` solo rellena ese
+  dato en unos 16 clips; por eso la consulta del streamer ya lo pide.
+- No se repite un clip de un Short de los últimos `no_repetir_dias`, ni uno que ya
+  esté en el historial de publicaciones, aunque sea antiguo.
+- Un streamer fijo entra con `min_clips_fijos` clips (1). El resto sigue en `min_clips` (2).
+  El juez, los derechos, el QA y los cupos no cambian. Los virales viejos no alimentan el radar.
+- Si el clip trae idioma y no es español, se descarta. Si no trae idioma, se queda.
+- `twitch.helix.activa` está en false: la GQL es el camino. Un 429 o un error deja
+  los clips ya reunidos y sigue. Helix no se llama y no pide credenciales. Un login
+  que no existe se avisa y se salta.
+
+Logins comprobados el 10 de noviembre de 2026 con `user(login){ clips(period: ALL_TIME) }`.
+Entran porque existen y tienen clips: `auronplay`, `rubius`, `thegrefg`, `vegetta777`,
+`ibai`, `juansguarnizo`, `rivers_gg`, `elmariana`, `spreen`, `quackity`, `coscu`,
+`carreraaa`, `robleis`. Fuera: `elrubius` existe pero no tiene clips en `LAST_DAY`,
+`LAST_WEEK`, `LAST_MONTH` ni `ALL_TIME`; el canal con clips es `rubius`. Tampoco se
+añadieron `riversgg` ni `samyrivera` (cuentas sin clips).
+
+Con `seleccion.historia.activa` el corte no sale de la misma intervención para
+llegar al mínimo: pide unos 8 s de planteamiento y cerca de 32 s, y la duración
+se mide después de quitar silencios (25-50 s). Si no llega, el motivo es
+`historia corta`. Un clip de Twitch de menos de 25 s con VOD se baja como
+ventana `(offset - 20, duración + 35)` de `twitch.tv/videos/<id>`; el pico se
+busca solo dentro del clip original. Si el VOD falla, se usa el clip y queda
+anotado. En YouTube la ventana es 60 s desde 20 s antes del pico
+(`contexto_antes` / `contexto_segundos`). En Kick se guarda la duración si
+yt-dlp la trae; el listado plano no da VOD ni segundo, así que el clip se queda
+como está. El ranking, con la historia activa, juzga clips de todos los
+streamers fijos e históricos hasta `candidatos_por_ejecucion` y se queda el de
+mejor nota, uno por streamer. El reporte guarda gancho, desarrollo y payoff.
+
+`asr.hotwords_activa` está en false. Si se enciende, `transcribe` pasa a
+faster-whisper 1.2.1 una pista de como mucho 200 caracteres (la lista `asr.hotwords`
+y el nombre del streamer) y nunca junto a `prefix`. Apagado, la llamada no cambia.
+
 ## Selección de momentos
 
 Cada Short es **un solo momento completo** por defecto (`seleccion.max_momentos: 1`).

@@ -15,7 +15,16 @@ Criterios:
 - remate: tras el pico quedan al menos ``remate_min_segundos`` y alguna palabra.
 - autocontencion: no empieza con un conector («y», «pero», «porque»...), no
   acaba colgando («de», «que», «el»...) y tiene al menos ``min_palabras``.
+  Cruzar dos unidades solo avisa: un diálogo seguido puede hacerlo.
+- cierre_colgante: la última palabra es gramatical («por», «de», «que»...),
+  aunque el reconocedor le pegue «.», «!», «?» o puntos suspensivos. Pesa 0
+  para no mover la nota del resto y, aun así, rechaza siempre: no depende de
+  ``obligatorios`` ni de la puntuación. No decide si la historia tiene causa
+  o remate; eso siguen midiéndolo final_completo (pausa o puntuación) y
+  remate (tiempo y alguna palabra tras el pico).
 - duracion: la duración final está entre seleccion.segundos_min y segundos_max.
+- arco: informativo, peso 0. Al menos 3 frases, voz 6 s antes del pico y una
+  proporción de voz. No rechaza por sí solo.
 
 Es una heurística sobre la transcripción: no entiende el chiste ni el contexto.
 """
@@ -34,6 +43,10 @@ WEIGHTS = {
     "remate": 0.2,
     "autocontencion": 0.1,
     "duracion": 0.1,
+    # Peso 0: no cambia la media. El rechazo de cierre_colgante va aparte.
+    "cierre_colgante": 0.0,
+    # Peso 0 e informativo: no entra en el rechazo si no está en obligatorios.
+    "arco": 0.0,
 }
 
 DEFAULTS: dict = {
@@ -80,13 +93,19 @@ class Judgement:
     score: float
     criteria: dict = field(default_factory=dict)
     reasons: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    abstentions: list[str] = field(default_factory=list)
+    decision: str = "rechazo"
 
     def to_dict(self) -> dict:
         return {
             "aceptado": self.accepted,
+            "decision": self.decision,
             "puntuacion": round(self.score, 3),
             "criterios": self.criteria,
             "motivos": self.reasons,
+            "avisos": self.warnings,
+            "abstenciones": self.abstentions,
         }
 
     @property
@@ -96,6 +115,18 @@ class Judgement:
 
 def _plain(word: str) -> str:
     return re.sub(r"[^\wáéíóúñü]", "", word, flags=re.IGNORECASE).casefold()
+
+
+def _dangling_close(text: str) -> bool:
+    """«por», «por.» o «que?» siguen colgados. «Sí.», «¿Cómo?» y «él» no.
+
+    La lista guarda la forma sin tilde (``si``, ``como``, ``el``). ``_plain``
+    conserva la tilde, así que «Sí» no es ``si`` y «él» no es ``el``. Eso no
+    prueba que la frase tenga sentido: solo separa el nexo escrito así del
+    monosílabo acentuado. Una frase de contenido sin punto tampoco se da por
+    cerrada; lo decide el segmentador, no esta lista.
+    """
+    return _plain(text) in DANGLING_ENDS
 
 
 def judge(
@@ -143,12 +174,18 @@ def judge(
     # remate
     after = segment.end - segment.peak
     words_after = [word for word in inside if word.start >= segment.peak]
-    payoff = after >= float(s["remate_min_segundos"]) and bool(words_after)
+    before = [word for word in inside if word.start < segment.peak - 1e-3]
+    payoff = after >= float(s["remate_min_segundos"]) and bool(words_after) and bool(before)
+    if not before:
+        remate_motivo = "el pico abre el tramo; el tiempo posterior no demuestra un remate"
+    elif payoff:
+        remate_motivo = f"{after:.1f} s y {len(words_after)} palabras tras el pico, con voz antes"
+    else:
+        remate_motivo = f"acaba en el pico: {after:.1f} s y {len(words_after)} palabras después"
     put(
         "remate",
-        1.0 if payoff else (0.5 if after >= float(s["remate_min_segundos"]) else 0.0),
-        f"{after:.1f} s y {len(words_after)} palabras tras el pico" if payoff
-        else f"acaba en el pico: {after:.1f} s y {len(words_after)} palabras después",
+        1.0 if payoff else (0.5 if after >= float(s["remate_min_segundos"]) and bool(before) else 0.0),
+        remate_motivo,
     )
     # autocontención
     points = 1.0
@@ -156,7 +193,8 @@ def judge(
     if inside and _plain(inside[0].text) in START_CONNECTORS:
         points -= 0.5
         notes.append(f"empieza con «{inside[0].text.strip()}»")
-    if inside and _plain(inside[-1].text) in DANGLING_ENDS and not inside[-1].text.rstrip().endswith(narrative_segments.SENTENCE_END):
+    dangling = bool(inside) and _dangling_close(inside[-1].text)
+    if dangling:
         points -= 0.5
         notes.append(f"acaba colgando en «{inside[-1].text.strip()}»")
     if len(inside) < int(s["min_palabras"]):
@@ -166,6 +204,23 @@ def judge(
         points -= 0.25
         notes.append("mezcla dos intervenciones")
     put("autocontencion", points, "; ".join(notes) or "se entiende solo")
+    put(
+        "cierre_colgante",
+        0.0 if dangling else 1.0,
+        f"la última palabra «{inside[-1].text.strip()}» no cierra" if dangling else "la última palabra no es un nexo colgado",
+    )
+    # arco: no mueve la nota. Sirve para leer en el reporte si había historia.
+    frases = int(segment.sentences or 0)
+    previos = [word for word in inside if word.start < segment.peak - 1e-3]
+    planteo = (segment.peak - previos[0].start) if previos else 0.0
+    voz = sum(max(0.0, word.end - word.start) for word in inside)
+    proporcion = (voz / duration) if duration > 0 else 0.0
+    arco_ok = frases >= 3 and planteo >= 6.0 and proporcion >= 0.35
+    put(
+        "arco",
+        1.0 if arco_ok else 0.0,
+        f"{frases} frases, {planteo:.1f} s antes del pico, voz {proporcion:.0%}",
+    )
     # duración
     ok_length = selection["segundos_min"] <= duration <= selection["segundos_max"]
     put(
@@ -176,6 +231,25 @@ def judge(
 
     score = sum(WEIGHTS[name] * criteria[name]["puntos"] for name in WEIGHTS) / sum(WEIGHTS.values())
     reasons = [f"{name}: {criteria[name]['motivo']}" for name in s["obligatorios"] if not criteria[name]["ok"]]
+    # Invariante: el JSON de producción lista otros obligatorios y no puede apagar esto.
+    if not criteria["cierre_colgante"]["ok"]:
+        reasons.append(f"cierre_colgante: {criteria['cierre_colgante']['motivo']}")
     if score < float(s["puntuacion_min"]):
         reasons.append(f"puntuación {score:.2f} < {float(s['puntuacion_min']):.2f}")
-    return Judgement(not reasons, score, criteria, reasons)
+    reasons = list(dict.fromkeys(reasons))
+    # Solo cuando el mínimo de duración obliga a traer otra unidad. Una pausa
+    # corta, dentro de la misma unidad, no entra aquí.
+    abstentions = []
+    if segment.crosses_units:
+        abstentions.append(
+            "abstencion: se unió otra unidad solo para la duración mínima; no hay evidencia de una sola historia"
+        )
+    blocking = {item.split(":", 1)[0] for item in reasons}
+    warnings = [
+        f"{name}: {criteria[name]['motivo']}"
+        for name, item in criteria.items()
+        if not item["ok"] and name not in blocking
+    ]
+    accepted = not reasons and not abstentions
+    decision = "aceptado" if accepted else "rechazo" if reasons else "abstencion"
+    return Judgement(accepted, score, criteria, reasons, warnings, abstentions, decision)
