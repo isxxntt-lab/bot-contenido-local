@@ -243,6 +243,7 @@ class OllamaVision:
         return {"ok": True, "modelo": self.model, "digest": digests[0], "fuente": "/api/tags"}
 
     def complete(self, prompt: str, images: list[str]) -> dict:
+        import paquete_contextual
         body = build_request(self.model, prompt, images, self.num_ctx, self.keep_alive)
         trace = {
             "raw": "",
@@ -257,7 +258,7 @@ class OllamaVision:
             "n_images": len(images),
             "prompt_chars": len(prompt),
         }
-        marca = self.observador.marca() if self.observador is not None else None
+        marca = self.observador.observar() if isinstance(self.observador, paquete_contextual.SesionServidor) else None
         wire = json.dumps(body).encode("utf-8")
         trace["cuerpo_bytes_sha256"] = hashlib.sha256(wire).hexdigest()
         request = urllib.request.Request(
@@ -284,8 +285,11 @@ class OllamaVision:
         trace["eval_count"] = payload.get("eval_count")
         trace["modelo"] = self.model
         trace["digest"] = self.digest
-        trace["log_previo"] = self.observador.texto_hasta(marca) if self.observador is not None and marca is not None else None
-        trace["log_nuevo"] = self.observador.texto_desde(marca) if self.observador is not None and marca is not None else None
+        trozo = self.observador.recoger() if isinstance(self.observador, paquete_contextual.SesionServidor) else None
+        trace["sesion"] = self.observador if trozo else None
+        trace["recorte"] = trozo
+        trace["log_previo"] = trozo[0] if trozo else None
+        trace["log_nuevo"] = trozo[1] if trozo else None
         if payload.get("load_duration") is not None:
             trace["load_duration_ms"] = round(payload["load_duration"] / 1e6, 1)
         if payload.get("total_duration") is not None:
@@ -298,6 +302,7 @@ class OllamaVision:
 
     def preflight(self, prompt: str, images: list[str], cuerpo: dict | None = None) -> dict:
         """Mide la entrada completa. Genera un token y lo descarta; no es un juicio."""
+        import paquete_contextual
         juicio = cuerpo if cuerpo is not None else build_request(self.model, prompt, images, self.num_ctx, self.keep_alive)
         enviado = cuerpo_preflight(juicio)
         trace = {
@@ -318,7 +323,7 @@ class OllamaVision:
             trace["error"] = "la petición de preflight no conserva la entrada del juicio"
             trace["done_reason"] = "entrada_distinta"
             return trace
-        marca = self.observador.marca() if self.observador is not None else None
+        marca = self.observador.observar() if isinstance(self.observador, paquete_contextual.SesionServidor) else None
         wire = json.dumps(enviado).encode("utf-8")
         trace["cuerpo_bytes_sha256"] = hashlib.sha256(wire).hexdigest()
         request = urllib.request.Request(
@@ -343,8 +348,11 @@ class OllamaVision:
         trace["eval_count"] = payload.get("eval_count")
         trace["modelo"] = self.model
         trace["digest"] = self.digest
-        trace["log_previo"] = self.observador.texto_hasta(marca) if self.observador is not None and marca is not None else None
-        trace["log_nuevo"] = self.observador.texto_desde(marca) if self.observador is not None and marca is not None else None
+        trozo = self.observador.recoger() if isinstance(self.observador, paquete_contextual.SesionServidor) else None
+        trace["sesion"] = self.observador if trozo else None
+        trace["recorte"] = trozo
+        trace["log_previo"] = trozo[0] if trozo else None
+        trace["log_nuevo"] = trozo[1] if trozo else None
         trace["cuerpo_bytes_sha256"] = hashlib.sha256(wire).hexdigest()
         trace["correlacion"] = {
             "valida": False,

@@ -361,18 +361,32 @@ def correlacionar_observacion(respuesta: dict) -> dict:
         return {**vacio, "motivo": "la respuesta no trae prompt_eval_count"}
     if not respuesta.get("modelo") or not respuesta.get("digest"):
         return {**vacio, "motivo": "no hay modelo o digest observado en el runtime"}
-    if not isinstance(respuesta.get("log_previo"), str) or not isinstance(respuesta.get("log_nuevo"), str):
-        return {**vacio, "motivo": "falta el log previo o el nuevo; no se puede excluir un renglón viejo"}
-    previas = {(item["slot"], item["task"]) for item in paradas_en_log(respuesta["log_previo"])}
-    nuevas = [item for item in paradas_en_log(respuesta["log_nuevo"]) if (item["slot"], item["task"]) not in previas]
-    posts = len(_POST_CHAT.findall(respuesta["log_nuevo"]))
+    sesion = respuesta.get("sesion")
+    if not isinstance(sesion, SesionServidor) or not sesion.respaldada or sesion.contaminada or not sesion.intacta():
+        return {**vacio, "motivo": "no hay sesión dedicada respaldada o el log cambió de identidad"}
+    if not isinstance(sesion.ultima, tuple):
+        return {**vacio, "motivo": "la sesión no recogió el log de esta llamada"}
+    recorte = respuesta.get("recorte")
+    if recorte not in sesion.recortes:
+        return {**vacio, "motivo": "el recorte no salió de esta sesión"}
+    log_previo, log_nuevo = recorte
+    previas = {(item["slot"], item["task"]) for item in paradas_en_log(log_previo)}
+    nuevas = [item for item in paradas_en_log(log_nuevo) if (item["slot"], item["task"]) not in previas]
+    posts = len(_POST_CHAT.findall(log_nuevo))
     base = {
         "prompt_eval_count": count,
         "eval_count": respuesta.get("eval_count") if isinstance(respuesta.get("eval_count"), int) else None,
     }
+    sesion = respuesta.get("sesion")
+    if not isinstance(sesion, SesionServidor) or not sesion.respaldada or sesion.contaminada or not sesion.intacta():
+        return {**vacio, **base, "motivo": "no hay sesión dedicada respaldada o el log cambió de identidad"}
     if len(nuevas) != 1 or posts != 1:
         return {**vacio, **base, "motivo": "el log nuevo no ata una única parada y un único POST a esta llamada"}
     linea = nuevas[0]
+    if linea["slot"] != 0 or linea["task"] != sesion.siguiente_task:
+        return {**vacio, **base, "motivo": "la parada no es la tarea siguiente de esta sesión"}
+    if linea["truncated"] == 0:
+        sesion.siguiente_task = linea["task"] + 1
     return {
         "valida": linea["truncated"] == 0,
         "truncated": linea["truncated"],
@@ -385,6 +399,84 @@ def correlacionar_observacion(respuesta: dict) -> dict:
         **base,
         "motivo": "parada nueva de esta llamada" if linea["truncated"] == 0 else f"truncated={linea['truncated']}",
     }
+
+
+class SesionServidor:
+    """Log nuevo de un proceso que abrimos nosotros. Un booleano del caller no basta."""
+
+    def __init__(self, path: Path, pid: int, sello: object) -> None:
+        if sello is not _SELLO_SESION:
+            raise RuntimeError("la sesión solo la abre adoptar_sesion")
+        self.path = Path(path)
+        self.pid = int(pid)
+        self.respaldada = True
+        self.contaminada = False
+        self.en_vuelo = False
+        self.siguiente_task = 0
+        self.recortes = []
+        self._marca = None
+        self.ultima = None
+        self._alta = self.path.stat().st_size
+        self._ident = _identidad_archivo(self.path)
+        if paradas_en_log(self.path.read_text(encoding="utf-8", errors="replace")):
+            self.contaminada = True
+
+    def intacta(self) -> bool:
+        if self.contaminada or not self.path.is_file():
+            return False
+        ident = _identidad_archivo(self.path)
+        if ident[:3] != self._ident[:3]:
+            return False
+        if self.path.stat().st_size < self._alta:
+            return False
+        return True
+
+    def observar(self) -> int | None:
+        if self.en_vuelo or not self.intacta():
+            self.contaminada = True
+            self.en_vuelo = False
+            return None
+        self.en_vuelo = True
+        self._marca = self.path.stat().st_size
+        self._ident_marca = _identidad_archivo(self.path)
+        return self._marca
+
+    def recoger(self) -> tuple[str, str] | None:
+        if not self.en_vuelo or self._marca is None or not self.intacta():
+            self.contaminada = True
+            self.en_vuelo = False
+            return None
+        if _identidad_archivo(self.path)[:3] != self._ident_marca[:3]:
+            self.contaminada = True
+            self.en_vuelo = False
+            return None
+        data = self.path.read_bytes()
+        if len(data) < self._marca:
+            self.contaminada = True
+            self.en_vuelo = False
+            return None
+        self._alta = len(data)
+        self.en_vuelo = False
+        self.ultima = (
+            data[:self._marca].decode("utf-8", "replace"),
+            data[self._marca:].decode("utf-8", "replace"),
+        )
+        self.recortes.append(self.ultima)
+        return self.ultima
+
+
+def _identidad_archivo(path: Path) -> tuple:
+    st = path.stat()
+    ctime = getattr(st, "st_ctime_ns", int(st.st_ctime * 1_000_000_000))
+    return (st.st_dev, st.st_ino, ctime, st.st_size)
+
+
+def adoptar_sesion(path: Path, pid: int) -> SesionServidor:
+    """Ata el log ya creado para este pid. Si ya hay paradas, la sesión nace contaminada."""
+    return SesionServidor(Path(path), pid, _SELLO_SESION)
+
+
+_SELLO_SESION = object()
 
 
 def cobertura_entrada(package: dict) -> dict | None:

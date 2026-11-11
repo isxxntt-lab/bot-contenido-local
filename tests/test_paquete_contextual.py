@@ -215,62 +215,65 @@ def test_la_entrada_del_preflight_es_la_del_paquete_y_deja_fuera_el_contexto():
     assert huella != paquete_contextual.huella_entrada(prompt, juez_contextual.OUTPUT_SCHEMA, ["a", "b", "d"], 5120)
 
 
-def test_el_preflight_se_cierra_sin_correlacion_de_esta_llamada():
+def _anotar(sesion, task: int, n_tokens: int, flag: int = 0):
+    assert sesion.observar() is not None
+    with sesion.path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            f"slot      release: id  0 | task {task} | stop processing: n_tokens = {n_tokens}, truncated = {flag}\n"
+            '[GIN] POST     "/api/chat"\n'
+        )
+    return sesion.recoger()
+
+
+def test_una_parada_ajena_con_un_post_no_se_adopta(tmp_path):
     package = _package()
     inst = {"huella": "h", "cuerpo_bytes_sha256": "cuerpo", "campos": {"prompt": "p"}}
-    base = {
+    log = tmp_path / "ollama.log"
+    log.write_bytes(b"")
+    sesion = paquete_contextual.adoptar_sesion(log, 77)
+    _anotar(sesion, 9, 3769)
+    trace = {
         "raw": "",
-        "prompt_eval_count": 4799,
-        "eval_count": 1,
-        "done_reason": "length",
+        "prompt_eval_count": 3611,
+        "eval_count": 159,
+        "done_reason": "stop",
         "error": None,
         "num_ctx": paquete_contextual.NUM_CTX,
         "num_predict_enviado": 1,
-        "sesion_id": "s1",
         "modelo": "modelo",
         "digest": "digest",
-        "inicio_ms": 0,
-        "fin_ms": 20,
         "cuerpo_bytes_sha256": "cuerpo",
-        "modelo": "modelo",
-        "digest": "digest",
-        "eval_count": 1,
-        "log_previo": "",
-        "log_nuevo": (
-            "slot      release: id  0 | task 1 | stop processing: n_tokens = 3611, truncated = 0\n"
-            '[GIN] POST     "/api/chat"\n'
-        ),
+        "sesion": sesion,
+        "recorte": sesion.recortes[-1],
     }
-    ok = paquete_contextual.aplicar_preflight(package, base, inst)
-    assert ok["preflight"]["aplicada"] is True
-    assert ok["correlacion"]["buffer_n_tokens"] == 3611
-    assert ok["correlacion"]["prompt_eval_count"] == 4799
-    juicio = dict(base, prompt_eval_count=3611, eval_count=159, log_previo=base["log_nuevo"], log_nuevo=(
-        "slot      release: id  0 | task 2 | stop processing: n_tokens = 3769, truncated = 0\n"
-        '[GIN] POST     "/api/chat"\n'
-    ))
-    adoptado = paquete_contextual.aplicar_preflight(package, juicio, inst)
+    cerrado = paquete_contextual.aplicar_preflight(package, trace, inst)
+    assert cerrado["preflight"]["aplicada"] is False
+    assert paquete_contextual.aplicar_preflight(package, {**trace, "sesion": {"dedicada": True}}, inst)["preflight"]["aplicada"] is False
+    log.write_bytes(b"")
+    propia = paquete_contextual.adoptar_sesion(log, 77)
+    _anotar(propia, 0, 3611)
+    primero = {
+        **trace,
+        "prompt_eval_count": 4799,
+        "eval_count": 1,
+        "sesion": propia,
+        "recorte": propia.recortes[-1],
+    }
+    assert paquete_contextual.aplicar_preflight(package, primero, inst)["preflight"]["aplicada"] is True
+    _anotar(propia, 1, 3769)
+    segundo = {
+        **primero,
+        "prompt_eval_count": 3611,
+        "eval_count": 159,
+        "recorte": propia.recortes[-1],
+    }
+    adoptado = paquete_contextual.aplicar_preflight(package, segundo, inst)
     assert adoptado["preflight"]["aplicada"] is True
     assert adoptado["correlacion"]["buffer_n_tokens"] == 3769
     assert adoptado["correlacion"]["prompt_eval_count"] == 3611
     assert adoptado["correlacion"]["eval_count"] == 159
-    sin_log = dict(base, log_nuevo="")
-    assert paquete_contextual.aplicar_preflight(package, sin_log, inst)["preflight"]["aplicada"] is False
-    suelto = dict(base, log_nuevo="", truncated=0)
-    assert paquete_contextual.aplicar_preflight(package, suelto, inst)["preflight"]["aplicada"] is False
-    sin_post = dict(base, log_nuevo="slot      release: id  0 | task 1 | stop processing: n_tokens = 3611, truncated = 0\n")
-    assert paquete_contextual.aplicar_preflight(package, sin_post, inst)["preflight"]["aplicada"] is False
-    doble = dict(base, log_nuevo=base["log_nuevo"].replace("task 1", "task 3", 1) + base["log_nuevo"])
-    assert paquete_contextual.aplicar_preflight(package, doble, inst)["preflight"]["aplicada"] is False
-    marcado = dict(base, log_nuevo=base["log_nuevo"].replace("truncated = 0", "truncated = 1"))
-    assert paquete_contextual.aplicar_preflight(package, marcado, inst)["preflight"]["aplicada"] is False
-    sin_previo = dict(base)
-    del sin_previo["log_previo"]
-    assert paquete_contextual.aplicar_preflight(package, sin_previo, inst)["preflight"]["aplicada"] is False
-    sin_digest = dict(base, digest=None)
-    assert paquete_contextual.aplicar_preflight(package, sin_digest, inst)["preflight"]["aplicada"] is False
-    misma_etiqueta = dict(base, cuerpo_bytes_sha256="otra")
-    assert paquete_contextual.aplicar_preflight(package, misma_etiqueta, {"huella": "h", "cuerpo_bytes_sha256": "h"})["preflight"]["aplicada"] is False
+    log.write_bytes(b"x")
+    assert propia.intacta() is False
     misma_etiqueta = dict(base, cuerpo_sha256="otra")
     assert paquete_contextual.aplicar_preflight(package, misma_etiqueta, {"huella": "h", "cuerpo_sha256": "h"})["preflight"]["aplicada"] is False
     assert paquete_contextual.truncados_en_log("") == []
@@ -308,13 +311,10 @@ def test_el_cliente_real_solo_cambia_el_tope_y_lee_el_log_nuevo(tmp_path, monkey
     import hashlib
     import juez_contextual
     log = tmp_path / "server.log"
-    log.write_text(
-        "slot      release: id  0 | task 0 | stop processing: n_tokens = 1, truncated = 0\n",
-        encoding="utf-8",
-    )
-    obs = juez_contextual.ObservadorLog(log)
+    log.write_bytes(b"")
+    sesion = paquete_contextual.adoptar_sesion(log, 42)
     crudos = []
-    tarea = {"n": 1}
+    tarea = {"n": 0}
 
     class Respuesta:
         def __enter__(self):
@@ -324,10 +324,11 @@ def test_el_cliente_real_solo_cambia_el_tope_y_lee_el_log_nuevo(tmp_path, monkey
             return False
 
         def read(self):
+            n = tarea["n"]
             tarea["n"] += 1
             with log.open("a", encoding="utf-8") as handle:
                 handle.write(
-                    f"slot      release: id  0 | task {tarea['n']} | "
+                    f"slot      release: id  0 | task {n} | "
                     "stop processing: n_tokens = 3769, truncated = 0\n"
                     '[GIN] POST     "/api/chat"\n'
                 )
@@ -335,7 +336,7 @@ def test_el_cliente_real_solo_cambia_el_tope_y_lee_el_log_nuevo(tmp_path, monkey
                 "message": {"content": '{"decision":"abstain","motivo":"x","evidencias":[]}'},
                 "done_reason": "stop",
                 "prompt_eval_count": 3611,
-                "eval_count": 159 if tarea["n"] == 3 else 1,
+                "eval_count": 159 if n == 1 else 1,
             }).encode()
 
     def urlopen(request, timeout=0):
@@ -343,7 +344,7 @@ def test_el_cliente_real_solo_cambia_el_tope_y_lee_el_log_nuevo(tmp_path, monkey
         return Respuesta()
 
     monkeypatch.setattr(juez_contextual.urllib.request, "urlopen", urlopen)
-    client = juez_contextual.OllamaVision("http://127.0.0.1:9", "qwen3-vl:4b-instruct", observador=obs)
+    client = juez_contextual.OllamaVision("http://127.0.0.1:9", "qwen3-vl:4b-instruct", observador=sesion)
     client.digest = "digest-observado"
     pre = client.preflight("hola", ["aaaa"])
     comp = client.complete("hola", ["aaaa"])
@@ -376,6 +377,9 @@ def test_la_vista_mide_el_mismo_paquete_y_juzga_una_vez(tmp_path):
         check=True,
     )
     seen = {}
+    bitacora = tmp_path / "sesion.log"
+    bitacora.write_bytes(b"")
+    sesion = paquete_contextual.adoptar_sesion(bitacora, 7)
 
     class Transporte:
         modelo = "modelo"
@@ -390,6 +394,14 @@ def test_la_vista_mide_el_mismo_paquete_y_juzga_una_vez(tmp_path):
                 enviado["messages"] = [{"role": "user", "content": "prompt cambiado", "images": images}]
             raw = json.dumps(enviado).encode("utf-8")
             count = 80
+            sesion.observar()
+            with sesion.path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"slot      release: id  0 | task {sesion.siguiente_task} | "
+                    f"stop processing: n_tokens = {count}, truncated = 0\n"
+                    '[GIN] POST     "/api/chat"\n'
+                )
+            recorte = sesion.recoger()
             return {
                 "raw": "",
                 "prompt_eval_count": count,
@@ -400,18 +412,22 @@ def test_la_vista_mide_el_mismo_paquete_y_juzga_una_vez(tmp_path):
                 "num_predict_enviado": 1,
                 "modelo": self.modelo,
                 "digest": self.digest,
-                "log_previo": "",
-                "log_nuevo": (
-                    "slot      release: id  0 | task 1 | "
-                    f"stop processing: n_tokens = {count}, truncated = 0\n"
-                    '[GIN] POST     "/api/chat"\n'
-                ),
+                "sesion": sesion,
+                "recorte": recorte,
                 "cuerpo_bytes_sha256": hashlib.sha256(raw).hexdigest(),
             }
 
         def complete(self, prompt, images):
             seen["juzgo"] = seen.get("juzgo", 0) + 1
             seen["prompt_juicio"] = prompt
+            sesion.observar()
+            with sesion.path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"slot      release: id  0 | task {sesion.siguiente_task} | "
+                    "stop processing: n_tokens = 238, truncated = 0\n"
+                    '[GIN] POST     "/api/chat"\n'
+                )
+            recorte = sesion.recoger()
             return {
                 "raw": json.dumps({"decision": "abstain", "motivo": "stub", "evidencias": []}),
                 "done_reason": "stop",
@@ -422,14 +438,8 @@ def test_la_vista_mide_el_mismo_paquete_y_juzga_una_vez(tmp_path):
                 "num_predict": 220,
                 "modelo": self.modelo,
                 "digest": self.digest,
-                "log_previo": (
-                    "slot      release: id  0 | task 1 | stop processing: n_tokens = 80, truncated = 0\n"
-                    '[GIN] POST     "/api/chat"\n'
-                ),
-                "log_nuevo": (
-                    "slot      release: id  0 | task 2 | stop processing: n_tokens = 238, truncated = 0\n"
-                    '[GIN] POST     "/api/chat"\n'
-                ),
+                "sesion": sesion,
+                "recorte": recorte,
             }
 
     words = [
